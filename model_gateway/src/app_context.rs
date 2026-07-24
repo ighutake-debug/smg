@@ -19,6 +19,7 @@ use crate::{
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
+    rate_limit::RateLimitManager,
     routers::{
         common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
         grpc::multimodal::MultimodalConfigRegistry,
@@ -52,6 +53,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -92,6 +94,7 @@ pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -145,6 +148,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
+            rate_limit_manager: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -178,6 +182,14 @@ impl AppContextBuilder {
 
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    /// Build the tenant rate limiter from config. `None` (feature
+    /// disabled, or config failed to load — logged at ERROR) is a valid,
+    /// non-fatal outcome.
+    fn maybe_rate_limit_manager(mut self, config: &RouterConfig) -> Self {
+        self.rate_limit_manager = RateLimitManager::from_config(config);
         self
     }
 
@@ -338,6 +350,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            rate_limit_manager: self.rate_limit_manager,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
@@ -390,6 +403,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
+            .maybe_rate_limit_manager(&router_config)
             .with_tokenizer_registry()
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
