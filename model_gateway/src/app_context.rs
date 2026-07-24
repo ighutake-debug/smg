@@ -185,12 +185,14 @@ impl AppContextBuilder {
         self
     }
 
-    /// Build the tenant rate limiter from config. `None` (feature
-    /// disabled, or config failed to load — logged at ERROR) is a valid,
-    /// non-fatal outcome.
-    fn maybe_rate_limit_manager(mut self, config: &RouterConfig) -> Self {
-        self.rate_limit_manager = RateLimitManager::from_config(config);
-        self
+    /// Build the tenant rate limiter from config. `Ok(None)` (feature
+    /// disabled) is a valid, non-fatal outcome. `Err` (enabled but the
+    /// policy YAML failed to load/parse/validate) fails startup — an
+    /// operator who explicitly turned rate limiting on must not get a
+    /// gateway that silently runs unlimited.
+    fn maybe_rate_limit_manager(mut self, config: &RouterConfig) -> Result<Self, String> {
+        self.rate_limit_manager = RateLimitManager::from_config(config)?;
+        Ok(self)
     }
 
     pub fn tokenizer_registry(mut self, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
@@ -403,7 +405,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
-            .maybe_rate_limit_manager(&router_config)
+            .maybe_rate_limit_manager(&router_config)?
             .with_tokenizer_registry()
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
