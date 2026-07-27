@@ -753,4 +753,41 @@ mod tests {
             overload_token_usage_threshold: 1.0,
         }));
     }
+
+    #[test]
+    fn maybe_rate_limit_manager_disabled_is_ok_none() {
+        let config = RouterConfig::default();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_none());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_missing_file_fails_startup() {
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some("/nonexistent/rate_limit.yaml".to_string()))
+            .build_unchecked();
+        assert!(AppContextBuilder::new()
+            .maybe_rate_limit_manager(&config)
+            .is_err());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
+        )
+        .unwrap();
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
+            .build_unchecked();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_some());
+    }
 }
