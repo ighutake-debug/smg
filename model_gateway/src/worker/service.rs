@@ -597,6 +597,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_worker_rejects_mixed_case_scheme() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let err = service
+            .create_worker(worker_spec("HTTP://10.0.0.5:8000"))
+            .await
+            .expect_err("mixed-case scheme must be rejected at the boundary");
+
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
     async fn create_worker_accepts_schemed_url() {
         let registry = Arc::new(WorkerRegistry::new());
         let service = make_service(registry);

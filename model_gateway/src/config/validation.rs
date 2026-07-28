@@ -35,18 +35,20 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         });
     }
 
-    // Case-insensitive scheme allow-list. Compare just the scheme
-    // segment so we don't allocate a lowercased copy of the full URL.
+    // Exact (lowercase) scheme allow-list. Case-insensitive matching is
+    // tempting but wrong here: the AddWorker workflow's normalize_url
+    // matches schemes case-sensitively, so a mixed-case scheme would be
+    // rewritten downstream and diverge from the reservation key — the
+    // same orphan failure as a schemeless URL.
     const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
-    if !ALLOWED_SCHEMES
-        .iter()
-        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
-    {
+    if !ALLOWED_SCHEMES.contains(&scheme) {
         return Err(ConfigError::InvalidValue {
             field: "worker_url".to_string(),
             value: url.to_string(),
-            reason: "URL must start with http://, https://, grpc://, or grpcs://".to_string(),
+            reason:
+                "URL must start with a lowercase http://, https://, grpc://, or grpcs:// scheme"
+                    .to_string(),
         });
     }
 
@@ -1055,8 +1057,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_url_scheme_match_is_case_insensitive() {
-        assert!(validate_worker_url("HTTP://10.0.0.5:8000").is_ok());
+    fn worker_url_rejects_non_lowercase_scheme() {
+        // normalize_url in the AddWorker workflow matches schemes
+        // case-sensitively, so `HTTP://…` would be mangled into
+        // `http://HTTP://…` and orphan the reservation just like a
+        // schemeless URL would.
+        assert!(validate_worker_url("HTTP://10.0.0.5:8000").is_err());
+        assert!(validate_worker_url("Grpc://10.0.0.5:50051").is_err());
     }
 
     #[test]
