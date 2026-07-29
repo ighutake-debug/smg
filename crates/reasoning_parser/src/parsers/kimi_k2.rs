@@ -64,12 +64,12 @@ impl KimiK2Parser {
         }
     }
 
-    /// Length of the longest buffer suffix that is a proper prefix of an end
-    /// marker — held back while streaming so split markers aren't emitted as
-    /// reasoning text.
-    fn trailing_marker_prefix(buffer: &str) -> usize {
+    /// Length of the longest buffer suffix that is a proper prefix of one of
+    /// `tokens` — held back while streaming so split markers aren't emitted
+    /// as text.
+    fn trailing_prefix_of(buffer: &str, tokens: &[&str]) -> usize {
         let mut longest = 0;
-        for token in [THINK_END, TOOL_SECTION_START] {
+        for token in tokens {
             for n in 1..token.len() {
                 if buffer.ends_with(&token[..n]) {
                     longest = longest.max(n);
@@ -132,7 +132,13 @@ impl ReasoningParser for KimiK2Parser {
         self.buffer.push_str(text);
 
         if self.reasoning_ended {
-            return Ok(ParserResult::normal(std::mem::take(&mut self.buffer)));
+            // Hold back a trailing partial tool-section marker: downstream
+            // tool parsers drain marker-less deltas as user-visible text, so
+            // a split marker would never reassemble.
+            let hold = Self::trailing_prefix_of(&self.buffer, &[TOOL_SECTION_START]);
+            let end = self.buffer.len() - hold;
+            let normal: String = self.buffer.drain(..end).collect();
+            return Ok(ParserResult::normal(normal));
         }
 
         // Resolve the leading <think> question exactly once: consume it if
@@ -151,11 +157,18 @@ impl ReasoningParser for KimiK2Parser {
 
         if let Some((idx, kind)) = Self::find_reasoning_end(&self.buffer) {
             let reasoning = self.buffer[..idx].to_string();
-            let normal = match kind {
-                EndKind::ThinkEnd => self.buffer[idx + THINK_END.len()..].to_string(),
-                EndKind::ToolSection => self.buffer[idx..].to_string(),
+            let (normal, held) = match kind {
+                EndKind::ThinkEnd => {
+                    let rest = &self.buffer[idx + THINK_END.len()..];
+                    let hold = Self::trailing_prefix_of(rest, &[TOOL_SECTION_START]);
+                    (
+                        rest[..rest.len() - hold].to_string(),
+                        rest[rest.len() - hold..].to_string(),
+                    )
+                }
+                EndKind::ToolSection => (self.buffer[idx..].to_string(), String::new()),
             };
-            self.buffer.clear();
+            self.buffer = held;
             self.in_reasoning = false;
             self.reasoning_ended = true;
             return Ok(ParserResult::new(normal, reasoning));
@@ -163,7 +176,7 @@ impl ReasoningParser for KimiK2Parser {
 
         // Stream everything except a trailing suffix that may be the start of
         // an end marker split across chunks.
-        let hold = Self::trailing_marker_prefix(&self.buffer);
+        let hold = Self::trailing_prefix_of(&self.buffer, &[THINK_END, TOOL_SECTION_START]);
         let end = self.buffer.len() - hold;
         let reasoning: String = self.buffer.drain(..end).collect();
         Ok(ParserResult::reasoning(reasoning))
@@ -296,6 +309,28 @@ mod tests {
         assert!(parser.is_in_reasoning());
         let result = parser.detect_and_parse_reasoning(K26_GOLDEN).unwrap();
         assert_eq!(result.reasoning_text, K26_GOLDEN_REASONING);
+    }
+
+    #[test]
+    fn kimi_k2_streaming_preserves_tool_marker_split_at_transition() {
+        // The chunk boundary falls right after </think>, leaving a partial
+        // tool-section marker. The reasoning parser must not emit the
+        // fragment: downstream tool parsers drain marker-less deltas as
+        // user-visible text, so a split marker would be lost forever.
+        let chunks = ["reasoning</think><|tool_calls_se", "ction_begin|>rest"];
+        let mut parser = KimiK2Parser::new();
+
+        let r1 = parser
+            .parse_reasoning_streaming_incremental(chunks[0])
+            .unwrap();
+        assert_eq!(r1.reasoning_text, "reasoning");
+        assert_eq!(r1.normal_text, "");
+
+        let r2 = parser
+            .parse_reasoning_streaming_incremental(chunks[1])
+            .unwrap();
+        assert_eq!(r2.reasoning_text, "");
+        assert_eq!(r2.normal_text, "<|tool_calls_section_begin|>rest");
     }
 
     #[test]
