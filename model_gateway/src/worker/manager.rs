@@ -1085,10 +1085,10 @@ mod tests {
                 }
             }),
         );
-        let port = portpicker::pick_unused_port().expect("free port");
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
         #[expect(
             clippy::disallowed_methods,
             reason = "test stub server lives for the duration of the test process"
@@ -1096,7 +1096,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("stub serve");
         });
-        format!("http://127.0.0.1:{port}")
+        format!("http://{addr}")
     }
 
     #[tokio::test]
