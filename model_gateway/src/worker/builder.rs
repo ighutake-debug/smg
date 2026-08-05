@@ -5,16 +5,18 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerModels, WorkerSpec, WorkerStatus},
 };
+use tokio::sync::mpsc;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    event::WorkerConnected,
     resilience::ResolvedResilience,
     worker::{
         BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType,
         DEFAULT_WORKER_HTTP_TIMEOUT_SECS,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
+use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -27,7 +29,7 @@ pub struct BasicWorkerBuilder {
     health_config: Option<HealthCheckConfig>,
     health_endpoint: String,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<GrpcClient>,
+    backend_client: Option<BackendClient>,
     /// Pre-built per-worker HTTP client (if not set, a default is created).
     http_client: Option<reqwest::Client>,
     /// Resolved resilience config (if not set, defaults are used).
@@ -37,6 +39,8 @@ pub struct BasicWorkerBuilder {
     /// Callers replacing an existing worker (e.g. metadata updates) should
     /// pass the old worker's status to avoid kicking it back to Pending.
     initial_status: Option<WorkerStatus>,
+    /// Connect-readiness signal sender (ZMQ registration path only).
+    connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
 }
 
 impl BasicWorkerBuilder {
@@ -47,10 +51,11 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
+            connect_signal_tx: None,
         }
     }
 
@@ -61,10 +66,11 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
+            connect_signal_tx: None,
         }
     }
 
@@ -77,10 +83,11 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
+            connect_signal_tx: None,
         }
     }
 
@@ -111,6 +118,13 @@ impl BasicWorkerBuilder {
     /// Set the runtime type (SGLang or vLLM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.spec.runtime_type = runtime_type;
+        self
+    }
+
+    /// Set the explicit ZMQ handshake bind address (replaces the address
+    /// derived from the ipc:// worker URL). Only meaningful for ZMQ workers.
+    pub fn zmq_handshake_address(mut self, address: impl Into<String>) -> Self {
+        self.spec.zmq_handshake_address = Some(address.into());
         self
     }
 
@@ -160,9 +174,17 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
-        self.grpc_client = Some(client);
+    /// Set the backend client (gRPC or ZMQ) for a local worker.
+    pub fn backend_client(mut self, client: BackendClient) -> Self {
+        self.backend_client = Some(client);
+        self
+    }
+
+    /// Wire the connect-readiness signal sender (from the registry) so a ZMQ
+    /// worker can wake the manager the instant its handshake completes. Only
+    /// meaningful for ZMQ workers; HTTP/gRPC promotion stays poll-driven.
+    pub fn connect_signal_tx(mut self, tx: mpsc::UnboundedSender<WorkerConnected>) -> Self {
+        self.connect_signal_tx = Some(tx);
         self
     }
 
@@ -233,12 +255,18 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(mut self) -> BasicWorker {
-        use std::sync::Arc;
+        use std::sync::{atomic::AtomicBool, Arc};
 
         use tokio::sync::OnceCell;
 
-        // Derive bootstrap_host from URL at construction time
-        self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+        // bootstrap_host is a PD/TCP-disaggregation concept (a host:port peer),
+        // so derive it only for transports that carry a host. An ipc:// ZMQ
+        // worker has no host; leave bootstrap_host empty rather than forcing the
+        // URL through host:port parsing (which would warn and default to
+        // localhost).
+        if self.spec.connection_mode != ConnectionMode::Zmq {
+            self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+        }
 
         // Resolve health config: use explicit config if set, otherwise
         // apply per-worker overrides from spec.health to defaults.
@@ -252,16 +280,16 @@ impl BasicWorkerBuilder {
             health_endpoint: self.health_endpoint,
         };
 
-        // Use OnceCell for lock-free gRPC client access after initialization
-        let grpc_client = Arc::new(match self.grpc_client {
-            Some(client) => {
-                let cell = OnceCell::new();
-                // Pre-set the client if provided (blocking set is fine during construction)
+        // OnceCell for lock-free client access after initialization; ArcSwap so
+        // the ZMQ health probe can evict a dead client (see BasicWorker docs).
+        let backend_client = {
+            let cell = OnceCell::new();
+            if let Some(client) = self.backend_client {
+                // Pre-set the client if provided (set on a fresh cell cannot fail)
                 cell.set(Arc::new(client)).ok();
-                cell
             }
-            None => OnceCell::new(),
-        });
+            Arc::new(ArcSwap::from_pointee(cell))
+        };
 
         // Caller can override the initial status (e.g. when replacing an
         // existing worker, to preserve its prior status). Otherwise:
@@ -296,7 +324,9 @@ impl BasicWorkerBuilder {
                 metadata.spec.url.clone(),
             )),
             metadata,
-            grpc_client,
+            backend_client,
+            zmq_connect_started: Arc::new(AtomicBool::new(false)),
+            connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,
@@ -349,6 +379,20 @@ mod tests {
 
     use super::*;
     use crate::worker::worker::Worker;
+
+    #[test]
+    fn zmq_handshake_address_reaches_the_built_spec() {
+        // The connect path reads the override from the built worker's spec, so
+        // dropping it here would silently fall back to the derived address.
+        let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .zmq_handshake_address("tcp://127.0.0.1:30500")
+            .build();
+        assert_eq!(
+            worker.metadata().spec.zmq_handshake_address.as_deref(),
+            Some("tcp://127.0.0.1:30500")
+        );
+    }
 
     #[test]
     fn test_basic_worker_builder_minimal() {

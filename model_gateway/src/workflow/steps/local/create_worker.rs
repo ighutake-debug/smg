@@ -63,17 +63,34 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let kv_role = labels.remove("kv_role");
         let kv_engine_id = labels.remove("kv_engine_id").filter(|s| !s.is_empty());
 
-        // Determine model_id: config.models > discovered labels > UNKNOWN_MODEL_ID
-        let model_id = config
-            .models
-            .primary()
-            .map(|m| m.id.clone())
-            .or_else(|| labels.get("served_model_name").cloned())
-            .or_else(|| labels.get("model_id").cloned())
-            .or_else(|| labels.get("model_path").cloned())
-            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        let model_id = resolve_model_id(config, &labels);
+        // ZMQ EngineCore does not report a served model name over the wire, so a
+        // ZMQ worker's model identity must come from config (`--model-path`).
+        // Without it the worker would register as UNKNOWN and be unroutable, so
+        // fail loudly at registration rather than silently.
+        let model_id = if model_id == UNKNOWN_MODEL_ID && *connection_mode == ConnectionMode::Zmq {
+            app_context
+                .router_config
+                .model_path
+                .as_deref()
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message: format!(
+                        "ZMQ worker {} has no model identity: EngineCore does not report a \
+                         served model name, so --model-path (or a model_id label) is required",
+                        config.url
+                    ),
+                })?
+        } else {
+            model_id
+        };
 
-        let model_card = build_model_card(&model_id, config, &labels);
+        let model_card = build_model_card(
+            model_id,
+            config,
+            &labels,
+            &app_context.router_config.model_aliases,
+        );
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -92,6 +109,29 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             );
             RuntimeType::Sglang
         };
+
+        validate_zmq_handshake_override(config, *connection_mode).map_err(|message| {
+            WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message,
+            }
+        })?;
+
+        // Only vLLM EngineCore and TokenSpeed speak the ZMQ direct-backend wire.
+        // Fail registration here rather than letting the connect-time rejection
+        // strand the worker in Pending.
+        if *connection_mode == ConnectionMode::Zmq
+            && !matches!(runtime_type, RuntimeType::Vllm | RuntimeType::TokenSpeed)
+        {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "ZMQ worker {} has unsupported runtime {}: only vllm and tokenspeed \
+                     are supported over the ZMQ direct backend",
+                    config.url, runtime_type
+                ),
+            });
+        }
 
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
@@ -130,6 +170,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 .dp_info
                 .as_ref()
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
+            validate_zmq_dp(*connection_mode, dp_info.dp_size, &config.url)?;
             (0..dp_info.dp_size)
                 .map(|r| Some((r, dp_info.dp_size)))
                 .collect()
@@ -172,6 +213,16 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 if let Some(ref e) = kv_engine_id {
                     builder = builder.kv_engine_id(e);
                 }
+                if let Some(ref address) = config.zmq_handshake_address {
+                    builder = builder.zmq_handshake_address(address.clone());
+                }
+                // ZMQ promotion is event-driven: the worker signals the manager
+                // the instant its handshake completes, so wire the registry's
+                // connect signal. Other transports promote via polling.
+                if *connection_mode == ConnectionMode::Zmq {
+                    builder = builder
+                        .connect_signal_tx(app_context.worker_registry.connect_signal_sender());
+                }
 
                 // Builder sets initial status: Pending if health-checked, Ready if not.
                 Arc::new(builder.build()) as Arc<dyn Worker>
@@ -196,10 +247,27 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     }
 }
 
+/// Resolve the canonical model ID before aliases are applied.
+///
+/// Kubernetes service discovery creates a spec without model cards, so its
+/// canonical ID comes from the backend's `served_model_name`. Router aliases
+/// are deliberately absent from this function and cannot change discovery.
+fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, String>) -> &'a str {
+    config
+        .models
+        .primary()
+        .map(|model| model.id.as_str())
+        .or_else(|| labels.get("served_model_name").map(String::as_str))
+        .or_else(|| labels.get("model_id").map(String::as_str))
+        .or_else(|| labels.get("model_path").map(String::as_str))
+        .unwrap_or(UNKNOWN_MODEL_ID)
+}
+
 fn build_model_card(
     model_id: &str,
     config: &WorkerSpec,
     labels: &HashMap<String, String>,
+    model_aliases: &HashMap<String, String>,
 ) -> ModelCard {
     let user_provided = config.models.find(model_id).is_some();
     let mut card = config
@@ -280,6 +348,18 @@ fn build_model_card(
         card.model_type |= ModelType::VISION;
     }
 
+    // Router-level alias map (`--model-alias alias=canonical`): attach every
+    // alias that names this canonical model. This is the only alias entry
+    // point for automatically registered workers (startup URLs, Kubernetes
+    // service discovery) — the backend reports a single served model name, so
+    // it can never declare aliases itself. A user-provided card keeps its own
+    // aliases; duplicates are skipped so re-registration stays idempotent.
+    for (alias, canonical) in model_aliases {
+        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
+            card.aliases.push(alias.clone());
+        }
+    }
+
     card
 }
 
@@ -301,24 +381,67 @@ fn infer_non_generation_type(labels: &HashMap<String, String>) -> ModelType {
     ModelType::EMBEDDINGS
 }
 
+/// `zmq_handshake_address` only steers the ZMQ handshake bind; on any other
+/// connection mode it would be silently ignored, so reject the registration
+/// loudly instead.
+fn validate_zmq_handshake_override(
+    config: &WorkerSpec,
+    connection_mode: ConnectionMode,
+) -> Result<(), String> {
+    if config.zmq_handshake_address.is_some() && connection_mode != ConnectionMode::Zmq {
+        return Err(format!(
+            "worker {} sets zmq_handshake_address but its connection mode is \
+             {connection_mode:?}: the field is only meaningful for ZMQ workers",
+            config.url
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
     if url.starts_with("http://")
         || url.starts_with("https://")
         || url.starts_with("grpc://")
         || url.starts_with("grpcs://")
+        || url.starts_with("ipc://")
     {
         url.to_string()
     } else {
         match connection_mode {
             ConnectionMode::Http => format!("http://{url}"),
             ConnectionMode::Grpc => format!("grpc://{url}"),
+            ConnectionMode::Zmq => format!("ipc://{url}"),
         }
     }
+}
+
+/// Reject a data-parallel worker the ZMQ path cannot serve.
+///
+/// A ZMQ worker binds a single EngineCore connection (engine_count=1); DP>1
+/// needs the coordinator + wave protocol (not yet implemented), so fail loudly
+/// rather than silently under-connecting. Only ZMQ with `dp_size > 1` is
+/// rejected; gRPC/HTTP data parallelism and single-engine ZMQ are fine.
+fn validate_zmq_dp(
+    connection_mode: ConnectionMode,
+    dp_size: usize,
+    url: &str,
+) -> Result<(), WorkflowError> {
+    if connection_mode == ConnectionMode::Zmq && dp_size > 1 {
+        return Err(WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message: format!(
+                "ZMQ worker {url} cannot run data-parallel (dp_size={dp_size}); \
+                 DP>1 over ZMQ is not yet supported"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::WorkerRegistry;
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {
@@ -350,5 +473,139 @@ mod tests {
             normalize_url("localhost:30001", ConnectionMode::Grpc),
             "grpc://localhost:30001"
         );
+    }
+
+    #[test]
+    fn zmq_handshake_override_is_rejected_off_the_zmq_path() {
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.zmq_handshake_address = Some("tcp://127.0.0.1:30500".to_string());
+
+        for mode in [ConnectionMode::Http, ConnectionMode::Grpc] {
+            let err = validate_zmq_handshake_override(&spec, mode)
+                .expect_err("non-ZMQ workers must reject the handshake override");
+            assert!(err.contains("zmq_handshake_address"), "{err}");
+        }
+        // On the ZMQ path the override is legitimate; unset is always fine.
+        assert!(validate_zmq_handshake_override(&spec, ConnectionMode::Zmq).is_ok());
+        assert!(
+            validate_zmq_handshake_override(&WorkerSpec::new("x"), ConnectionMode::Http).is_ok()
+        );
+    }
+
+    fn alias_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(alias, canonical)| (alias.to_string(), canonical.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn model_alias_map_attaches_matching_aliases_to_discovered_card() {
+        // The service-discovery path supplies no user card, so the card is
+        // built from the discovered model ID alone; the router-level alias
+        // map is the only way it can gain aliases.
+        let spec = WorkerSpec::new("http://worker:8080");
+        let aliases = alias_map(&[
+            ("GLM-5.2-Coding", "GLM-5.2"),
+            ("other-alias", "other-model"),
+        ]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert_eq!(card.id, "GLM-5.2");
+        assert_eq!(card.aliases, vec!["GLM-5.2-Coding".to_string()]);
+    }
+
+    #[test]
+    fn service_discovery_keeps_served_model_name_canonical() {
+        // Service discovery supplies an empty model list. Metadata discovery
+        // supplies the backend's served_model_name.
+        let spec = WorkerSpec::new("http://worker:8080");
+        let labels = HashMap::from([
+            ("served_model_name".to_string(), "GLM-5.2".to_string()),
+            ("model_id".to_string(), "GLM-5.2-Coding".to_string()),
+            ("model_path".to_string(), "unrelated-alias".to_string()),
+        ]);
+        let aliases = alias_map(&[
+            ("GLM-5.2-Coding", "GLM-5.2"),
+            ("unrelated-alias", "other-model"),
+        ]);
+
+        let model_id = resolve_model_id(&spec, &labels);
+        let card = build_model_card(model_id, &spec, &labels, &aliases);
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new(&spec.url).model(card).build());
+        let registry = WorkerRegistry::new();
+        registry.register(worker.clone()).unwrap();
+
+        assert_eq!(worker.model_id(), "GLM-5.2");
+        assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
+        assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 1);
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+            Some("GLM-5.2")
+        );
+        assert!(registry.get_by_model("unrelated-alias").is_empty());
+    }
+
+    #[test]
+    fn model_alias_map_is_case_sensitive_and_skips_self_reference() {
+        let spec = WorkerSpec::new("http://worker:8080");
+        // Wrong-case canonical must not match; an alias equal to the model ID
+        // must not be attached (it would shadow the canonical entry).
+        let aliases = alias_map(&[("glm-5.2-coding", "glm-5.2"), ("GLM-5.2", "GLM-5.2")]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert!(card.aliases.is_empty());
+    }
+
+    #[test]
+    fn zmq_data_parallel_is_rejected_as_a_create_worker_failure() {
+        // dp_size > 1 over ZMQ is the only rejected combination, and it must
+        // surface as a create_worker StepFailed.
+        let err = validate_zmq_dp(ConnectionMode::Zmq, 2, "ipc:///tmp/smg-zmq/ts0.ipc")
+            .expect_err("dp_size > 1 over ZMQ must be rejected");
+        match err {
+            WorkflowError::StepFailed { step_id, message } => {
+                assert_eq!(step_id, StepId::new("create_worker"));
+                assert!(message.contains("dp_size=2"), "message was: {message}");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_engine_zmq_and_data_parallel_grpc_are_accepted() {
+        // Single-engine ZMQ is the supported ZMQ shape; gRPC/HTTP data
+        // parallelism is untouched by the ZMQ guard.
+        validate_zmq_dp(ConnectionMode::Zmq, 1, "ipc:///tmp/smg-zmq/ts0.ipc")
+            .expect("single-engine ZMQ must be accepted");
+        validate_zmq_dp(ConnectionMode::Grpc, 4, "grpc://worker:8080")
+            .expect("gRPC data parallelism must be accepted");
+        validate_zmq_dp(ConnectionMode::Http, 4, "http://worker:8080")
+            .expect("HTTP data parallelism must be accepted");
+    }
+
+    #[test]
+    fn model_alias_map_does_not_duplicate_user_provided_alias() {
+        // POST /workers can already carry aliases in the spec; the router map
+        // must merge, not duplicate, so repeated registration stays stable.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        let card_with_alias = ModelCard::new("GLM-5.2").with_alias("GLM-5.2-Coding");
+        spec.models = vec![card_with_alias].into();
+        let aliases = alias_map(&[("GLM-5.2-Coding", "GLM-5.2"), ("glm-5.2", "GLM-5.2")]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert_eq!(
+            card.aliases
+                .iter()
+                .filter(|a| *a == "GLM-5.2-Coding")
+                .count(),
+            1
+        );
+        assert!(card.aliases.contains(&"glm-5.2".to_string()));
+        assert_eq!(card.aliases.len(), 2);
     }
 }

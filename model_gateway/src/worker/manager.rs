@@ -21,7 +21,7 @@ use openai_protocol::worker::{
     WorkerLoadsResult, WorkerStatus,
 };
 use tokio::{
-    sync::{broadcast, Notify},
+    sync::{broadcast, mpsc, Notify},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
-        event::WorkerEvent,
+        event::{WorkerConnected, WorkerEvent},
         metrics_aggregator::{self, MetricPack},
         monitor::WorkerMonitor,
         registry::{WorkerDescriptor, WorkerId},
@@ -50,6 +50,12 @@ struct WorkerResponse {
 }
 
 /// Fan out requests to workers in parallel
+///
+/// Requests are addressed to `worker.base_url()`, so under `--dp-aware`
+/// every rank of the same base worker targets the rank-free endpoint —
+/// `worker.url()` carries an `@{dp_rank}` suffix that is SMG-internal and
+/// not a valid server address (#1993). Callers that want one request per
+/// base worker must dedupe by base URL first (see `get_engine_metrics`).
 async fn fan_out(
     workers: &[Arc<dyn Worker>],
     client: &reqwest::Client,
@@ -60,7 +66,7 @@ async fn fan_out(
         .iter()
         .map(|worker| {
             let client = client.clone();
-            let url = worker.url().to_string();
+            let url = worker.base_url().to_string();
             let full_url = format!("{url}/{endpoint}");
             let api_key = worker.api_key().cloned();
             let method = method.clone();
@@ -130,6 +136,46 @@ pub struct WorkerManagerConfig {
 }
 
 impl WorkerManager {
+    /// Start the manager only if the background loop has work to do.
+    ///
+    /// The loop serves two roles: health polling and consuming the connect
+    /// signal that promotes workers waiting on a backend handshake (the
+    /// manager is that signal's sole consumer). When health checks are
+    /// globally disabled AND the ZMQ transport is off AND no worker is already
+    /// awaiting the connect signal, the loop would idle with nothing to
+    /// service, so it is skipped and `None` is returned.
+    ///
+    /// `zmq_transport_enabled` is decided from configuration up front, not from
+    /// the registry, because config workers register in the background after
+    /// this call — the registry snapshot here cannot be trusted to already show
+    /// them. When ZMQ is configured the loop starts regardless of the
+    /// health-check flag so it is ready to consume the connect signal the
+    /// instant a ZMQ worker's handshake lands. Health polling continues to
+    /// honor each worker's own disable flag, so starting the loop with global
+    /// health checks off does not resurrect polling for other transports.
+    pub fn maybe_start(
+        registry: Arc<WorkerRegistry>,
+        config: WorkerManagerConfig,
+        job_queue: Option<Arc<JobQueue>>,
+        health_checks_enabled: bool,
+        zmq_transport_enabled: bool,
+    ) -> Option<Self> {
+        if !health_checks_enabled
+            && !zmq_transport_enabled
+            && !registry.has_workers_awaiting_connect_signal()
+        {
+            info!(
+                "Global health checks disabled, ZMQ transport off, and no workers await the \
+                 connect signal; skipping WorkerManager"
+            );
+            return None;
+        }
+        let default_check_interval_secs = config.default_check_interval_secs;
+        let manager = Self::start(registry, config, job_queue);
+        debug!("Started WorkerManager loop with {default_check_interval_secs}s default interval");
+        Some(manager)
+    }
+
     /// Create and start the WorkerManager background loop.
     ///
     /// Spawns a single task that:
@@ -166,6 +212,11 @@ impl WorkerManager {
         let mut next_check: HashMap<WorkerId, tokio::time::Instant> = HashMap::new();
         reconcile_from_registry(&registry, &mut next_check, &config);
 
+        // Drain the connect-readiness signal (workers wake us the instant
+        // their backend handshake lands). Taken once — a second manager on
+        // the same registry would simply run poll-only.
+        let connect_rx = registry.take_connect_signal_receiver();
+
         let job_queue = if config.remove_unhealthy {
             job_queue
         } else {
@@ -180,6 +231,7 @@ impl WorkerManager {
             run_health_loop(
                 registry,
                 events_rx,
+                connect_rx,
                 next_check,
                 config,
                 job_queue,
@@ -250,6 +302,7 @@ type ProbeFutures = FuturesUnordered<Pin<Box<dyn Future<Output = ProbeCompletion
 async fn run_health_loop(
     registry: Arc<WorkerRegistry>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
+    mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
     config: WorkerManagerConfig,
     job_queue: Option<Arc<JobQueue>>,
@@ -299,6 +352,15 @@ async fn run_health_loop(
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
+            signal = recv_connect_signal(&mut connect_rx) => {
+                match signal {
+                    Some(connected) => apply_connect_signal(&registry, connected),
+                    // Every sender lives on the registry (Arc), so recv() only
+                    // returns None if the registry itself is gone. Drop the
+                    // branch so the loop stops polling a dead channel.
+                    None => connect_rx = None,
+                }
+            }
             event = events_rx.recv() => {
                 match event {
                     Ok(WorkerEvent::Registered { worker_id, worker }) => {
@@ -516,6 +578,40 @@ async fn apply_probe_completion(
     }
 
     ProbeApplyResult::Applied(transition)
+}
+
+/// Await the next connect-readiness signal, or park forever when there is no
+/// receiver (health checks disabled, or a second manager already took it). The
+/// `pending()` arm keeps this `select!` branch dormant instead of busy-looping.
+async fn recv_connect_signal(
+    rx: &mut Option<mpsc::UnboundedReceiver<WorkerConnected>>,
+) -> Option<WorkerConnected> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Promote a worker whose backend handshake just completed, without waiting
+/// for its next scheduled poll. Resolves the URL to a live worker id and flips
+/// the status through the revision-checked setter, so a signal that lost a race
+/// with a same-URL replacement — or a worker already removed — is discarded.
+fn apply_connect_signal(registry: &Arc<WorkerRegistry>, connected: WorkerConnected) {
+    let WorkerConnected { url, revision } = connected;
+    let Some(worker_id) = registry.get_id_by_url(&url) else {
+        debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
+        return;
+    };
+    match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
+        Some((old, new)) => {
+            debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
+        }
+        None => {
+            // No transition: already Ready (idempotent), or a stale revision
+            // after a same-URL replacement. Polling covers either case.
+            debug!(worker_url = %url, "Connect signal applied no transition");
+        }
+    }
 }
 
 fn resolved_interval_secs(health_config: &HealthCheckConfig, default_interval_secs: u64) -> u64 {
@@ -948,7 +1044,9 @@ impl WorkerManager {
                         ConnectionMode::Http => {
                             WorkerMonitor::fetch_http_load(&client, &worker).await
                         }
-                        ConnectionMode::Grpc => WorkerMonitor::fetch_grpc_load(&worker).await,
+                        ConnectionMode::Grpc | ConnectionMode::Zmq => {
+                            WorkerMonitor::fetch_backend_load(&worker).await
+                        }
                     };
                     // `load` is the absolute used-token count. Report it only
                     // when the backend actually provides absolute tokens
@@ -989,6 +1087,15 @@ impl WorkerManager {
             return EngineMetricsResult::Err("No available workers".to_string());
         }
 
+        // Scrape each base worker once: under `--dp-aware` all ranks share
+        // the base URL, so per-rank fan-out would repeat identical scrapes
+        // (#1993).
+        let mut seen = HashSet::new();
+        let workers: Vec<Arc<dyn Worker>> = workers
+            .into_iter()
+            .filter(|w| seen.insert(w.base_url().to_string()))
+            .collect();
+
         let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
 
         let mut metric_packs = Vec::new();
@@ -1018,12 +1125,20 @@ impl WorkerManager {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, Worker, WorkerError, WorkerRegistry, WorkerType};
+    use crate::worker::{
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerError, WorkerRegistry, WorkerType,
+    };
 
     fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
         Arc::new(
@@ -1039,6 +1154,296 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    fn make_zmq_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn maybe_start_skips_when_health_disabled_and_no_pending_zmq() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+
+        let manager = WorkerManager::maybe_start(
+            registry,
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            false,
+            false,
+        );
+        assert!(
+            manager.is_none(),
+            "no health polling and no connect-signal consumers needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_start_runs_when_health_disabled_but_zmq_pending() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let zmq = make_zmq_worker("ipc:///tmp/w.ipc");
+        assert_eq!(zmq.status(), WorkerStatus::Pending);
+        registry.register(zmq).unwrap();
+
+        let mut manager = WorkerManager::maybe_start(
+            registry,
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            false,
+            false,
+        )
+        .expect("manager must run to consume the connect signal for the pending ZMQ worker");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn maybe_start_runs_when_health_enabled() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+
+        let mut manager = WorkerManager::maybe_start(
+            registry,
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            true,
+            false,
+        )
+        .expect("manager must run when health checks are enabled");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn maybe_start_runs_when_zmq_transport_enabled_even_with_empty_registry() {
+        // Config workers register in the background after startup, so the
+        // registry is empty when maybe_start runs. With ZMQ configured the
+        // manager must still start — otherwise those late ZMQ workers would
+        // fire the connect signal at a manager that never took the receiver.
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut manager = WorkerManager::maybe_start(
+            registry,
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            false,
+            true,
+        )
+        .expect("manager must run when the ZMQ transport is configured");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
+        // End-to-end promotion through the running loop: the signal travels the
+        // registry sender -> manager select! -> apply_connect_signal, flipping
+        // the pending ZMQ worker to Ready. The worker starts Pending and its
+        // health probe (against a socket with no backend) can only fail, so the
+        // connect signal is the sole path to Ready under test.
+        let registry = Arc::new(WorkerRegistry::new());
+        let zmq = make_zmq_worker("ipc:///tmp/connect.ipc");
+        let revision = zmq.revision();
+        registry.register(zmq.clone()).unwrap();
+        assert_eq!(zmq.status(), WorkerStatus::Pending);
+
+        let mut manager = WorkerManager::maybe_start(
+            registry.clone(),
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            false,
+            true,
+        )
+        .expect("manager must run to consume the connect signal");
+
+        registry
+            .connect_signal_sender()
+            .send(WorkerConnected {
+                url: "ipc:///tmp/connect.ipc".to_string(),
+                revision,
+            })
+            .expect("connect signal must reach the manager loop");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while zmq.status() != WorkerStatus::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "manager loop did not promote the ZMQ worker in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        manager.shutdown().await;
+    }
+
+    fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": format!("{base}@{rank}"),
+            "dp_base_url": base,
+            "dp_rank": rank,
+            "dp_size": size,
+        }))
+        .expect("dp worker spec");
+        Arc::new(BasicWorkerBuilder::from_spec(spec).build())
+    }
+
+    #[test]
+    fn apply_connect_signal_promotes_pending_worker() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        let revision = worker.revision();
+        registry.register(worker.clone()).unwrap();
+
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://w:1".to_string(),
+                revision,
+            },
+        );
+
+        assert_eq!(
+            worker.status(),
+            WorkerStatus::Ready,
+            "a matching connect signal must promote a Pending worker immediately"
+        );
+    }
+
+    #[test]
+    fn apply_connect_signal_ignores_stale_revision() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        let stale_revision = worker.revision();
+        let worker_id = registry.register(worker).unwrap();
+
+        // A same-URL replace bumps the revision; a handshake that started
+        // against the old worker must not promote its replacement.
+        let replacement = make_worker("http://w:1", 2, 3);
+        assert!(registry.replace(&worker_id, replacement));
+        let current = registry.get(&worker_id).unwrap();
+        assert_eq!(current.revision(), stale_revision + 1);
+        assert_eq!(current.status(), WorkerStatus::Pending);
+
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://w:1".to_string(),
+                revision: stale_revision,
+            },
+        );
+
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Pending,
+            "a stale connect signal must not promote a replaced worker"
+        );
+    }
+
+    #[test]
+    fn apply_connect_signal_ignores_unknown_url() {
+        // A signal for a worker that was removed before its handshake landed
+        // must be a silent no-op, not a panic.
+        let registry = Arc::new(WorkerRegistry::new());
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://ghost:1".to_string(),
+                revision: 0,
+            },
+        );
+    }
+
+    /// Tiny HTTP stub counting GET /metrics hits; returns its base URL.
+    async fn start_metrics_stub(hits: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "# HELP test_metric stub\n# TYPE test_metric gauge\ntest_metric 1\n"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_scrapes_dp_workers_via_base_url_once() {
+        // Two DP ranks share one base worker. The `@{rank}` suffix in
+        // worker.url() is not a valid endpoint; metrics must be scraped
+        // from base_url(), once per base worker (#1993).
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = start_metrics_stub(hits.clone()).await;
+
+        let registry = WorkerRegistry::new();
+        registry.register(make_dp_worker(&base, 0, 2)).unwrap();
+        registry.register(make_dp_worker(&base, 1, 2)).unwrap();
+
+        let client = reqwest::Client::new();
+        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+
+        assert!(
+            matches!(result, EngineMetricsResult::Ok(_)),
+            "expected metrics scrape to succeed"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "base worker must be scraped once, not per DP rank"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_scrapes_each_distinct_base_worker() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let base_a = start_metrics_stub(hits_a.clone()).await;
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let base_b = start_metrics_stub(hits_b.clone()).await;
+
+        let registry = WorkerRegistry::new();
+        registry.register(make_dp_worker(&base_a, 0, 2)).unwrap();
+        registry.register(make_dp_worker(&base_a, 1, 2)).unwrap();
+        registry.register(make_dp_worker(&base_b, 0, 1)).unwrap();
+
+        let client = reqwest::Client::new();
+        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+
+        assert!(matches!(result, EngineMetricsResult::Ok(_)));
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
     }
 
     fn cfg(success_threshold: u32, failure_threshold: u32) -> HealthCheckConfig {

@@ -200,6 +200,9 @@ class RouterArgs:
     mesh_advertise_host: str | None = None
     mesh_port: int = 39527
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
+    # Append new fields here to preserve positional callers.
+    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
+    worker_startup_delay: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -553,6 +556,12 @@ class RouterArgs:
             ),
         )
         pd_group.add_argument(
+            f"--{prefix}worker-startup-delay",
+            type=int,
+            default=RouterArgs.worker_startup_delay,
+            help="Grace period in seconds before the first worker startup check (default: 0)",
+        )
+        pd_group.add_argument(
             f"--{prefix}worker-startup-check-interval",
             type=int,
             default=RouterArgs.worker_startup_check_interval,
@@ -678,6 +687,17 @@ class RouterArgs:
                 "Override each worker's model ID from pod metadata."
                 " Accepted values: 'namespace', 'label:<key>', 'annotation:<key>'."
                 " The backend-discovered model name becomes an alias."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}model-alias",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Accept an extra client-facing model name for a served model."
+                " Format: <alias>=<canonical>. Repeat for multiple aliases."
+                " Matching is case-sensitive."
             ),
         )
         # Prometheus configuration
@@ -972,8 +992,11 @@ class RouterArgs:
             f"--{prefix}backend",
             type=str,
             default=RouterArgs.backend,
-            choices=["sglang", "openai", "anthropic"],
-            help="Backend runtime to use (default: sglang)",
+            choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
+            help=(
+                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
+                "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+            ),
         )
         backend_group.add_argument(
             f"--{prefix}enable-wasm",
@@ -1323,6 +1346,9 @@ class RouterArgs:
         args_dict["storage_context_headers"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
+        args_dict["model_aliases"] = cls._parse_model_aliases(
+            cli_args_dict.get(f"{prefix}model_alias", [])
+        )
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
@@ -1378,6 +1404,34 @@ class RouterArgs:
                 key, value = item.split("=", 1)
                 selector[key] = value
         return selector
+
+    @staticmethod
+    def _parse_model_aliases(alias_list):
+        if not alias_list:
+            return {}
+
+        aliases = {}
+        for item in alias_list:
+            if "=" not in item:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Expected format: <alias>=<canonical>"
+                )
+            alias, canonical = item.split("=", 1)
+            if not alias or not canonical:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Alias and canonical model ID must be non-empty"
+                )
+            if alias == canonical:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Alias must differ from the canonical model ID"
+                )
+            previous = aliases.get(alias)
+            if previous is not None and previous != canonical:
+                raise ValueError(
+                    f"Invalid model alias '{alias}'. It maps to both '{previous}' and '{canonical}'"
+                )
+            aliases[alias] = canonical
+        return aliases
 
     @staticmethod
     def _parse_prefill_urls(prefill_list):

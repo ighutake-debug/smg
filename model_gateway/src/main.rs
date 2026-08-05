@@ -18,7 +18,7 @@ use smg::{
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
     version,
-    worker::ConnectionMode,
+    worker::{ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::MeshServerConfig;
@@ -75,6 +75,8 @@ pub enum Backend {
     Vllm,
     #[value(name = "trtllm")]
     Trtllm,
+    #[value(name = "tokenspeed")]
+    Tokenspeed,
     #[value(name = "openai")]
     Openai,
     #[value(name = "anthropic")]
@@ -89,6 +91,7 @@ impl std::fmt::Display for Backend {
             Backend::Sglang => "sglang",
             Backend::Vllm => "vllm",
             Backend::Trtllm => "trtllm",
+            Backend::Tokenspeed => "tokenspeed",
             Backend::Openai => "openai",
             Backend::Anthropic => "anthropic",
             Backend::Gemini => "gemini",
@@ -303,6 +306,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
 
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    worker_startup_delay: u64,
+
     /// Interval in seconds between worker startup checks
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
@@ -372,6 +379,14 @@ struct CliArgs {
     /// Accepted values: "namespace", "label:<key>", or "annotation:<key>"
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
+
+    /// Accept an extra client-facing model name for a served model
+    /// (format: alias=canonical, repeatable). Applied to every locally
+    /// registered worker whose model ID equals the canonical side,
+    /// including workers registered by Kubernetes service discovery.
+    /// Matching is case-sensitive.
+    #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
+    model_alias: Vec<String>,
 
     // ==================== Logging ====================
     /// Directory to store log files
@@ -837,6 +852,26 @@ fn parse_model_id_from(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
+fn parse_model_alias(s: &str) -> Result<String, String> {
+    let Some((alias, canonical)) = s.split_once('=') else {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Expected: <alias>=<canonical>"
+        ));
+    };
+    if alias.is_empty() || canonical.is_empty() {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias and canonical model ID must be non-empty"
+        ));
+    }
+    if alias == canonical {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias must differ from the canonical model ID"
+        ));
+    }
+    Ok(s.to_string())
+}
+
 /// Parse role mapping from CLI format "idp_role=gateway_role"
 #[expect(
     clippy::print_stderr,
@@ -964,12 +999,15 @@ impl CliArgs {
     }
 
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-        for url in worker_urls {
-            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc;
-            }
-        }
-        ConnectionMode::Http
+        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
+        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
+        worker_urls
+            .iter()
+            .find_map(|url| match ConnectionMode::from_url(url) {
+                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
+                _ => None,
+            })
+            .unwrap_or(ConnectionMode::Http)
     }
 
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
@@ -1364,6 +1402,20 @@ impl CliArgs {
         }
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
+        // `--backend` normally only steers the routing mode. Over ZMQ it
+        // additionally pins the startup workers' runtime: the shared EngineCore
+        // handshake carries no engine identity, so the wire protocol cannot be
+        // probed and must be declared. HTTP/gRPC keep auto-detection (None).
+        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
+            match self.backend {
+                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
+                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
@@ -1387,10 +1439,34 @@ impl CliArgs {
             _ => (None, None, None),
         };
 
+        // clap validated each entry's shape; here we only reject the same
+        // alias naming two different canonical models, which would make the
+        // routing outcome depend on argument order.
+        let mut model_aliases: HashMap<String, String> = HashMap::new();
+        for entry in &self.model_alias {
+            let Some((alias, canonical)) = entry.split_once('=') else {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_alias".to_string(),
+                    value: entry.clone(),
+                    reason: "Expected: <alias>=<canonical>".to_string(),
+                });
+            };
+            if let Some(previous) = model_aliases.insert(alias.to_string(), canonical.to_string()) {
+                if previous != canonical {
+                    return Err(ConfigError::InvalidValue {
+                        field: "model_alias".to_string(),
+                        value: alias.to_string(),
+                        reason: format!("Alias maps to both '{previous}' and '{canonical}'"),
+                    });
+                }
+            }
+        }
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .connection_mode(connection_mode)
+            .startup_worker_runtime_type(startup_worker_runtime_type)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -1398,6 +1474,7 @@ impl CliArgs {
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .engine_metrics(self.engine_metrics)
@@ -1464,6 +1541,7 @@ impl CliArgs {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .model_aliases(model_aliases)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
@@ -1860,5 +1938,79 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared
+    /// EngineCore handshake cannot be probed for a wire protocol). The pin must
+    /// reach `RouterConfig` and survive nesting into
+    /// `ServerConfig.router_config` — two-path config-plumbing guard.
+    #[test]
+    fn zmq_backend_pins_startup_worker_runtime_in_both_configs() {
+        let cli = cli_args_from(&[
+            "--backend",
+            "tokenspeed",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Zmq);
+        assert_eq!(
+            router_config.startup_worker_runtime_type,
+            Some(RuntimeType::TokenSpeed),
+            "--backend tokenspeed must pin the ZMQ startup worker runtime"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.startup_worker_runtime_type,
+            Some(RuntimeType::TokenSpeed),
+            "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// The runtime pin only disambiguates the ZMQ wire protocol: gRPC (and
+    /// HTTP) workers keep backend auto-detection even when `--backend` names an
+    /// engine, and a ZMQ deployment without `--backend` stays unpinned
+    /// (detect_backend's vLLM default applies).
+    #[test]
+    fn startup_worker_runtime_stays_unpinned_off_the_zmq_path() {
+        let grpc = cli_args_from(&[
+            "--backend",
+            "tokenspeed",
+            "--worker-urls",
+            "grpc://localhost:30001",
+        ]);
+        let router_config = grpc.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Grpc);
+        assert_eq!(router_config.startup_worker_runtime_type, None);
+
+        let zmq_no_backend = cli_args_from(&["--worker-urls", "ipc:///tmp/smg-zmq/engine-0"]);
+        let router_config = zmq_no_backend.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Zmq);
+        assert_eq!(router_config.startup_worker_runtime_type, None);
+
+        let zmq_vllm = cli_args_from(&[
+            "--backend",
+            "vllm",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        let router_config = zmq_vllm.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.startup_worker_runtime_type,
+            Some(RuntimeType::Vllm)
+        );
+    }
+
+    #[test]
+    fn conflicting_model_aliases_are_rejected() {
+        let cli = cli_args_from(&["--model-alias", "x=a", "--model-alias", "x=b"]);
+
+        assert!(matches!(
+            cli.to_router_config(vec![], vec![]),
+            Err(ConfigError::InvalidValue { field, reason, .. })
+                if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
+        ));
     }
 }

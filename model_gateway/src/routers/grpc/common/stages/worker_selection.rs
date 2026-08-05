@@ -21,7 +21,8 @@ use crate::{
         },
     },
     worker::{
-        ConnectionMode, HashRing, RuntimeType, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionModeExt, HashRing, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -228,18 +229,21 @@ impl WorkerSelectionStage {
             Some(model_id)
         };
 
-        // Get workers for the specified model, filtered by connection mode
+        // Get workers for the specified model. The gRPC router serves both gRPC
+        // and direct-ZMQ workers, so accept either transport (not HTTP).
         let workers = self.worker_registry.get_workers_filtered(
             model_filter,
             Some(WorkerType::Regular),
-            Some(ConnectionMode::Grpc),
+            None,  // grpc + zmq, filtered below
             None,  // any runtime type
             false, // get all workers, we'll filter by is_available() next
         );
 
         // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> =
-            workers.into_iter().filter(|w| w.is_available()).collect();
+        let available: Vec<Arc<dyn Worker>> = workers
+            .into_iter()
+            .filter(|w| w.connection_mode().uses_grpc_pipeline() && w.is_available())
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -269,7 +273,7 @@ impl WorkerSelectionStage {
         // Record worker selection metric
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_GRPC,
+            selected.connection_mode().as_metric_label(),
             model_id,
             policy.name(),
         );
@@ -291,11 +295,12 @@ impl WorkerSelectionStage {
             Some(model_id)
         };
 
+        // gRPC + direct-ZMQ workers both ride the gRPC router pipeline.
         let all_workers = self.worker_registry.get_workers_filtered(
             model_filter,
             None,
-            Some(ConnectionMode::Grpc), // Match any gRPC worker
-            None,                       // any runtime type
+            None, // grpc + zmq, filtered below
+            None, // any runtime type
             false,
         );
 
@@ -303,7 +308,7 @@ impl WorkerSelectionStage {
             all_workers
                 .into_iter()
                 .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.is_available() {
+                    if w.connection_mode().uses_grpc_pipeline() && w.is_available() {
                         match w.metadata().spec.worker_type {
                             WorkerType::Prefill => acc.0.push(w),
                             WorkerType::Decode => acc.1.push(w),
@@ -365,8 +370,9 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Select using policies
-        let policy = self.policy_registry.get_policy_or_default(model_id);
+        // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -380,29 +386,28 @@ impl WorkerSelectionStage {
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx = self
-            .policy_registry
-            .select_worker(&policy, &available_prefill, &info)?;
+        let prefill_idx =
+            self.policy_registry
+                .select_worker(&prefill_policy, &available_prefill, &info)?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx = self
-            .policy_registry
-            .select_worker(&policy, &available_decode, &info)?;
+        let decode_idx =
+            self.policy_registry
+                .select_worker(&decode_policy, &available_decode, &info)?;
 
         let model = model_id;
-        let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            prefill_policy.name(),
         );
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            decode_policy.name(),
         );
 
         Some((
@@ -433,18 +438,19 @@ impl WorkerSelectionStage {
             Some(model_id)
         };
 
+        // gRPC + direct-ZMQ workers both ride the gRPC router pipeline.
         let all_workers = self.worker_registry.get_workers_filtered(
             model_filter,
             None,
-            Some(ConnectionMode::Grpc), // Match any gRPC worker
-            None,                       // any runtime type
+            None, // grpc + zmq, filtered below
+            None, // any runtime type
             false,
         );
 
         let (all_encode, all_prefill, all_decode): (Vec<_>, Vec<_>, Vec<_>) = all_workers
             .into_iter()
             .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                if w.is_available() {
+                if w.connection_mode().uses_grpc_pipeline() && w.is_available() {
                     match w.metadata().spec.worker_type {
                         WorkerType::Encode => acc.0.push(w),
                         WorkerType::Prefill => acc.1.push(w),
@@ -653,4 +659,120 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use openai_protocol::worker::HealthCheckConfig;
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        policies::PolicyFactory,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+    };
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    fn register_pd_workers(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        n: usize,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut prefill_urls = Vec::with_capacity(n);
+        let mut decode_urls = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let url = format!("grpc://127.0.0.1:{}", 8000 + i);
+            prefill_urls.push(url.clone());
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Prefill)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        for i in 0..n {
+            let url = format!("grpc://127.0.0.1:{}", 8100 + i);
+            decode_urls.push(url.clone());
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Decode)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        (prefill_urls, decode_urls)
+    }
+
+    #[test]
+    fn select_pd_pair_round_robin_covers_all_workers_with_independent_policies() {
+        let model_id = "test-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        // Mirror production PD startup: create two independent RoundRobin instances.
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+
+        let prefill_policy = policy_registry.get_prefill_policy();
+        let decode_policy = policy_registry.get_decode_policy();
+        assert_eq!(prefill_policy.name(), "round_robin");
+        assert_eq!(decode_policy.name(), "round_robin");
+        assert!(
+            !Arc::ptr_eq(&prefill_policy, &decode_policy),
+            "prefill/decode must not share one RoundRobinPolicy counter"
+        );
+
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let mut prefill_hits: HashMap<String, usize> = HashMap::new();
+        let mut decode_hits: HashMap<String, usize> = HashMap::new();
+        for _ in 0..40 {
+            let (prefill, decode, _) = stage
+                .select_pd_pair(model_id, None, None, None)
+                .expect("select_pd_pair should return a pair");
+            *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
+            *decode_hits.entry(decode.url().to_string()).or_default() += 1;
+        }
+
+        for url in &prefill_urls {
+            assert_eq!(
+                prefill_hits.get(url).copied().unwrap_or(0),
+                10,
+                "prefill worker {url} should receive 10 of 40 selections"
+            );
+        }
+        for url in &decode_urls {
+            assert_eq!(
+                decode_hits.get(url).copied().unwrap_or(0),
+                10,
+                "decode worker {url} should receive 10 of 40 selections"
+            );
+        }
+    }
 }

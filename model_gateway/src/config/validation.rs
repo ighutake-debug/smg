@@ -18,9 +18,76 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Validate a single worker URL: non-empty, an allowed scheme, and a
+/// parseable host. Shared by [`ConfigValidator::validate_urls`] (startup
+/// config) and the worker-management API so both reject schemeless or
+/// unparsable URLs identically. Rejecting at the API boundary prevents
+/// the orphaned `url_to_id` reservation from #1533: the AddWorker
+/// workflow rewrites schemeless input via `normalize_url`, so a
+/// reservation keyed on the raw URL would never match the registered
+/// worker.
+pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
+    if url.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "worker_url".to_string(),
+            value: url.to_string(),
+            reason: "URL cannot be empty".to_string(),
+        });
+    }
+
+    // Exact (lowercase) scheme allow-list. Case-insensitive matching is
+    // tempting but wrong here: the AddWorker workflow's normalize_url
+    // matches schemes case-sensitively, so a mixed-case scheme would be
+    // rewritten downstream and diverge from the reservation key — the
+    // same orphan failure as a schemeless URL.
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
+    let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    if !ALLOWED_SCHEMES.contains(&scheme) {
+        return Err(ConfigError::InvalidValue {
+            field: "worker_url".to_string(),
+            value: url.to_string(),
+            reason: "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// scheme"
+                .to_string(),
+        });
+    }
+
+    // ipc:// worker URLs are same-host ZMQ unix-socket paths (no host); validate
+    // the path is present rather than requiring a host below.
+    if scheme == "ipc" {
+        let path = url.strip_prefix("ipc://").unwrap_or("");
+        if path.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_url".to_string(),
+                value: url.to_string(),
+                reason: "ipc:// worker URL must include a socket path".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    match ::url::Url::parse(url) {
+        Ok(parsed) => {
+            if parsed.host_str().is_none() {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_url".to_string(),
+                    value: url.to_string(),
+                    reason: "URL must have a valid host".to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_url".to_string(),
+                value: url.to_string(),
+                reason: format!("Invalid URL format: {e}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
-
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
@@ -29,6 +96,7 @@ impl ConfigValidator {
         Self::validate_storage_context_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_model_aliases(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -60,6 +128,27 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
+        for (alias, canonical) in &config.model_aliases {
+            if alias.is_empty() || canonical.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_aliases".to_string(),
+                    value: format!("{alias}={canonical}"),
+                    reason: "Alias and canonical model ID must be non-empty".to_string(),
+                });
+            }
+            if alias == canonical {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_aliases".to_string(),
+                    value: alias.clone(),
+                    reason: "Alias must differ from the canonical model ID".to_string(),
+                });
+            }
+        }
 
         Ok(())
     }
@@ -958,48 +1047,7 @@ impl ConfigValidator {
 
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
-            if url.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.clone(),
-                    reason: "URL cannot be empty".to_string(),
-                });
-            }
-
-            // Case-insensitive scheme allow-list. Compare just the scheme
-            // segment so we don't allocate a lowercased copy of the full URL.
-            const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs"];
-            let scheme = url.split_once("://").map_or("", |(s, _)| s);
-            if !ALLOWED_SCHEMES
-                .iter()
-                .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.clone(),
-                    reason: "URL must start with http://, https://, grpc://, or grpcs://"
-                        .to_string(),
-                });
-            }
-
-            match ::url::Url::parse(url) {
-                Ok(parsed) => {
-                    if parsed.host_str().is_none() {
-                        return Err(ConfigError::InvalidValue {
-                            field: "worker_url".to_string(),
-                            value: url.clone(),
-                            reason: "URL must have a valid host".to_string(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    return Err(ConfigError::InvalidValue {
-                        field: "worker_url".to_string(),
-                        value: url.clone(),
-                        reason: format!("Invalid URL format: {e}"),
-                    });
-                }
-            }
+            validate_worker_url(url)?;
         }
         Ok(())
     }
@@ -1032,6 +1080,56 @@ mod tests {
     }
 
     #[test]
+    fn worker_url_accepts_allowed_schemes() {
+        for url in [
+            "http://10.0.0.5:8000",
+            "https://worker.example.com",
+            "grpc://10.0.0.5:50051",
+            "grpcs://worker.example.com:443",
+        ] {
+            assert!(validate_worker_url(url).is_ok(), "expected {url} to pass");
+        }
+    }
+
+    #[test]
+    fn worker_url_rejects_non_lowercase_scheme() {
+        // normalize_url in the AddWorker workflow matches schemes
+        // case-sensitively, so `HTTP://…` would be mangled into
+        // `http://HTTP://…` and orphan the reservation just like a
+        // schemeless URL would.
+        assert!(validate_worker_url("HTTP://10.0.0.5:8000").is_err());
+        assert!(validate_worker_url("Grpc://10.0.0.5:50051").is_err());
+    }
+
+    #[test]
+    fn worker_url_rejects_empty() {
+        assert!(matches!(
+            validate_worker_url(""),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
+        ));
+    }
+
+    #[test]
+    fn worker_url_rejects_schemeless_host_port() {
+        // The #1533 case: bare host:port input would be rewritten by the
+        // AddWorker workflow, orphaning the API-layer ID reservation.
+        assert!(matches!(
+            validate_worker_url("10.0.0.5:8000"),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
+        ));
+    }
+
+    #[test]
+    fn worker_url_rejects_disallowed_scheme() {
+        assert!(validate_worker_url("ftp://example.com:21").is_err());
+    }
+
+    #[test]
+    fn worker_url_rejects_unparsable() {
+        assert!(validate_worker_url("http://").is_err());
+    }
+
+    #[test]
     fn test_validate_regular_mode() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -1041,6 +1139,29 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_model_aliases() {
+        let mut config = regular_mode_config();
+        config.model_aliases = std::collections::HashMap::from([
+            ("GLM-5.2-Coding".to_string(), "GLM-5.2".to_string()),
+            ("glm-5.2".to_string(), "GLM-5.2".to_string()),
+        ]);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for (alias, canonical) in [
+            ("", "GLM-5.2"),
+            ("GLM-5.2-Coding", ""),
+            ("GLM-5.2", "GLM-5.2"),
+        ] {
+            config.model_aliases =
+                std::collections::HashMap::from([(alias.to_string(), canonical.to_string())]);
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "model_aliases"
+            ));
+        }
     }
 
     fn regular_mode_config() -> RouterConfig {

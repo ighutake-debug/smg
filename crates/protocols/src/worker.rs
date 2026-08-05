@@ -84,6 +84,36 @@ pub enum ConnectionMode {
     Http,
     /// gRPC connection.
     Grpc,
+    /// Direct ZMQ connection to a same-host engine core (bypasses the gRPC
+    /// Python servicer). Speaks the engine's native ZMQ IPC.
+    Zmq,
+}
+
+impl ConnectionMode {
+    /// Classify a worker URL by its scheme — the single source of truth for
+    /// scheme → connection mode. Returns `None` for a bare `host:port` (no
+    /// scheme) or an unrecognized scheme, leaving the default to the caller
+    /// (some probe both protocols; some default to HTTP).
+    pub fn from_url(url: &str) -> Option<Self> {
+        if url.starts_with("ipc://") {
+            Some(ConnectionMode::Zmq)
+        } else if url.starts_with("grpc://") || url.starts_with("grpcs://") {
+            Some(ConnectionMode::Grpc)
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            Some(ConnectionMode::Http)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the gateway speaks the engine's wire protocol directly for this
+    /// mode. gRPC and direct-ZMQ are distinct transports that both ride the
+    /// gRPC-router pipeline (differing only in the client behind it); HTTP is
+    /// proxied and has its own router. Callers use this to treat gRPC and ZMQ
+    /// workers uniformly.
+    pub fn uses_grpc_pipeline(self) -> bool {
+        matches!(self, ConnectionMode::Grpc | ConnectionMode::Zmq)
+    }
 }
 
 impl std::fmt::Display for ConnectionMode {
@@ -91,6 +121,7 @@ impl std::fmt::Display for ConnectionMode {
         match self {
             ConnectionMode::Http => write!(f, "http"),
             ConnectionMode::Grpc => write!(f, "grpc"),
+            ConnectionMode::Zmq => write!(f, "zmq"),
         }
     }
 }
@@ -681,6 +712,14 @@ pub struct WorkerSpec {
     /// is used. Overrides the router-level `multimodal_shm_min_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
+
+    /// Handshake address the frontend BINDS for this worker's engine handshake.
+    /// Only meaningful for `connection_mode: zmq`; must be a `tcp://` address.
+    /// When unset, the frontend derives a deterministic port from the worker's
+    /// `ipc://` path instead — this override exists for engines that dial a
+    /// fixed, pre-agreed address rather than the derived one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zmq_handshake_address: Option<String>,
 }
 
 impl WorkerSpec {
@@ -713,6 +752,7 @@ impl WorkerSpec {
             load_monitor_interval_secs: None,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
+            zmq_handshake_address: None,
         }
     }
 }
@@ -1352,6 +1392,41 @@ impl IntoResponse for WorkerLoadsResult {
             })
             .collect();
         Json(json!({"workers": loads})).into_response()
+    }
+}
+
+#[cfg(test)]
+mod connection_mode_tests {
+    use super::ConnectionMode;
+
+    #[test]
+    fn from_url_classifies_known_schemes() {
+        assert_eq!(
+            ConnectionMode::from_url("ipc:///tmp/e"),
+            Some(ConnectionMode::Zmq)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("grpc://h:1"),
+            Some(ConnectionMode::Grpc)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("grpcs://h:1"),
+            Some(ConnectionMode::Grpc)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("http://h:1"),
+            Some(ConnectionMode::Http)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("https://h"),
+            Some(ConnectionMode::Http)
+        );
+    }
+
+    #[test]
+    fn from_url_returns_none_for_bare_or_unknown() {
+        assert_eq!(ConnectionMode::from_url("host:30000"), None);
+        assert_eq!(ConnectionMode::from_url("ftp://host"), None);
     }
 }
 

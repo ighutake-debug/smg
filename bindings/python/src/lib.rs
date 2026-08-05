@@ -27,6 +27,12 @@ pub enum BackendType {
     Sglang,
     Openai,
     Anthropic,
+    /// vLLM engine. Routing behaves like the default; over ZMQ this pins the
+    /// startup workers' wire protocol to vLLM EngineCore.
+    Vllm,
+    /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
+    /// the startup workers' wire protocol to TokenSpeed.
+    Tokenspeed,
 }
 
 #[pyclass(eq, from_py_object)]
@@ -486,16 +492,22 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    model_aliases: HashMap<String, String>,
+    worker_startup_delay: u64,
 }
 
 impl Router {
     fn determine_connection_mode(worker_urls: &[String]) -> worker::ConnectionMode {
-        for url in worker_urls {
-            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return worker::ConnectionMode::Grpc;
-            }
-        }
-        worker::ConnectionMode::Http
+        use worker::ConnectionMode;
+        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
+        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
+        worker_urls
+            .iter()
+            .find_map(|url| match ConnectionMode::from_url(url) {
+                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
+                _ => None,
+            })
+            .unwrap_or(ConnectionMode::Http)
     }
 
     fn parse_mesh_socket_addr(
@@ -731,6 +743,22 @@ impl Router {
             None
         };
 
+        // `backend` normally only steers the routing mode. Over ZMQ it
+        // additionally pins the startup workers' runtime: the shared EngineCore
+        // handshake carries no engine identity, so the wire protocol cannot be
+        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
+        // `to_router_config` in model_gateway/src/main.rs.
+        let startup_worker_runtime_type =
+            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
+                match self.backend {
+                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
+                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -738,9 +766,11 @@ impl Router {
             .port(self.port)
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
+            .startup_worker_runtime_type(startup_worker_runtime_type)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
@@ -795,6 +825,7 @@ impl Router {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .model_aliases(self.model_aliases.clone())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
             .maybe_redis(redis_config)
@@ -953,6 +984,8 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        model_aliases = HashMap::new(),
+        worker_startup_delay = 0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1079,6 +1112,8 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        model_aliases: HashMap<String, String>,
+        worker_startup_delay: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1219,6 +1254,8 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            model_aliases,
+            worker_startup_delay,
         })
     }
 
