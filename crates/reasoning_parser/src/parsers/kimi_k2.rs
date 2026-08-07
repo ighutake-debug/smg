@@ -198,7 +198,13 @@ impl ReasoningParser for KimiK2Parser {
     }
 
     fn mark_reasoning_started(&mut self) {
+        // A new turn begins in reasoning: clear the terminal latch and any
+        // stale buffer from the previous turn, and re-resolve the leading
+        // <think> question for the new output.
         self.in_reasoning = true;
+        self.reasoning_ended = false;
+        self.start_decided = false;
+        self.buffer.clear();
     }
 
     fn mark_think_start_stripped(&mut self) {
@@ -331,6 +337,26 @@ mod tests {
             .unwrap();
         assert_eq!(r2.reasoning_text, "");
         assert_eq!(r2.normal_text, "<|tool_calls_section_begin|>rest");
+    }
+
+    #[test]
+    fn kimi_k2_mark_reasoning_started_restarts_after_completion() {
+        // Parser reuse across turns: after a completed turn, the runtime marks
+        // the next turn as reasoning-from-start (template prefilled <think>).
+        // The parser must actually return to reasoning, not stay latched in
+        // the terminal state.
+        let mut parser = KimiK2Parser::new();
+        parser.detect_and_parse_reasoning(K26_GOLDEN).unwrap();
+        assert!(!parser.is_in_reasoning());
+
+        parser.mark_reasoning_started();
+        assert!(parser.is_in_reasoning());
+
+        let result = parser
+            .parse_reasoning_streaming_incremental("new turn thinking</think>new answer")
+            .unwrap();
+        assert_eq!(result.reasoning_text, "new turn thinking");
+        assert_eq!(result.normal_text, "new answer");
     }
 
     #[test]
