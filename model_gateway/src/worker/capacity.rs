@@ -151,12 +151,13 @@ impl WorkerCapacity {
         })
     }
 
-    /// Log once when the healthy fleet serves more than one model id.
+    /// Log once at startup when the healthy fleet serves more than one
+    /// model id.
     ///
     /// Capacity is a fleet-wide scalar, so multi-model admission limits are
     /// incorrect (#2069): an idle model's slots mask a saturated model's
-    /// queue. The warning fires at most once per tracker, at startup or on
-    /// the first event that makes the fleet multi-model.
+    /// queue. Startup-only by design — the check is O(fleet size), which is
+    /// not acceptable in the worker-event loop.
     fn warn_once_if_multi_model(&self, workers: &[Arc<dyn Worker>]) {
         if self.warned_multi_model.load(Ordering::Relaxed) {
             return;
@@ -247,15 +248,18 @@ fn healthy_workers(registry: &WorkerRegistry) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-/// Count distinct model ids across the given workers.
+/// Count distinct advertised model ids across the given workers.
 ///
-/// Used by the multi-model warning: capacity is a fleet-wide scalar, so a
-/// fleet reporting more than one model id gets incorrect per-model
-/// admission limits (#2069).
+/// Every model card counts, not just the primary — a worker serving
+/// several models must not read as single-model. Used by the multi-model
+/// warning: capacity is a fleet-wide scalar, so a fleet reporting more
+/// than one model id gets incorrect per-model admission limits (#2069).
 pub(super) fn distinct_model_count(workers: &[Arc<dyn Worker>]) -> usize {
     let mut seen = std::collections::HashSet::new();
     for w in workers {
-        seen.insert(w.model_id());
+        for card in w.models() {
+            seen.insert(card.id);
+        }
     }
     seen.len()
 }
@@ -289,7 +293,6 @@ async fn run_event_loop(
 
         let workers = healthy_workers(&r);
         let (new_capacity, new_source) = recompute(&settings, &workers);
-        t.warn_once_if_multi_model(&workers);
 
         let old_capacity = t.capacity.swap(new_capacity, Ordering::AcqRel);
         let old_source_raw = t.source.swap(new_source as u8, Ordering::AcqRel);
@@ -690,6 +693,36 @@ mod tests {
             worker_with_model("http://w2", "llama-7b"),
         ];
         assert_eq!(distinct_model_count(&workers), 1);
+    }
+
+    #[test]
+    fn distinct_model_count_counts_every_advertised_model_card() {
+        // One worker can advertise multiple model cards; counting only the
+        // primary id would undercount and suppress the warning.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://w1",
+            "models": [{"id": "llama-7b"}, {"id": "llama-70b"}],
+        }))
+        .expect("multi-model spec");
+        let workers =
+            vec![Arc::new(BasicWorkerBuilder::from_spec(spec).build()) as Arc<dyn Worker>];
+        assert_eq!(distinct_model_count(&workers), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_latches_warning_for_multi_model_registry() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let id1 = registry
+            .register(worker_with_model("http://w1", "llama-7b"))
+            .expect("registered");
+        registry.transition_status(&id1, WorkerStatus::Ready);
+        let id2 = registry
+            .register(worker_with_model("http://w2", "llama-70b"))
+            .expect("registered");
+        registry.transition_status(&id2, WorkerStatus::Ready);
+
+        let tracker = WorkerCapacity::spawn(registry, CapacityTrackerSettings::default());
+        assert!(tracker.warned_multi_model.load(Ordering::Relaxed));
     }
 
     #[test]
