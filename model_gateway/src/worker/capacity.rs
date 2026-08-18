@@ -257,8 +257,13 @@ fn healthy_workers(registry: &WorkerRegistry) -> Vec<Arc<dyn Worker>> {
 pub(super) fn distinct_model_count(workers: &[Arc<dyn Worker>]) -> usize {
     let mut seen = std::collections::HashSet::new();
     for w in workers {
-        for card in w.models() {
-            seen.insert(card.id);
+        let cards = w.models();
+        if cards.is_empty() {
+            // No model cards (e.g. wildcard or label-only worker) — fall back
+            // to the primary id, matching WorkerRegistry::worker_model_ids().
+            seen.insert(w.model_id().to_string());
+        } else {
+            seen.extend(cards.into_iter().map(|card| card.id));
         }
     }
     seen.len()
@@ -706,6 +711,22 @@ mod tests {
         .expect("multi-model spec");
         let workers =
             vec![Arc::new(BasicWorkerBuilder::from_spec(spec).build()) as Arc<dyn Worker>];
+        assert_eq!(distinct_model_count(&workers), 2);
+    }
+
+    #[test]
+    fn distinct_model_count_falls_back_to_primary_model_id_when_no_cards() {
+        // Label-only workers (no model cards) must still count — matches the
+        // WorkerRegistry::worker_model_ids() fallback.
+        let with_label = |url: &str, model: &str| {
+            let mut labels = HashMap::new();
+            labels.insert("model_id".to_string(), model.to_string());
+            Arc::new(BasicWorkerBuilder::new(url).labels(labels).build()) as Arc<dyn Worker>
+        };
+        let workers = vec![
+            with_label("http://w1", "llama-7b"),
+            with_label("http://w2", "llama-70b"),
+        ];
         assert_eq!(distinct_model_count(&workers), 2);
     }
 
