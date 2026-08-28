@@ -218,15 +218,25 @@ impl ParserRegistry {
                     let mut tag = build_fn(tools, at_least_one);
                     if !parallel_tool_calls {
                         // triggered_tags dialect: stop after the first complete
-                        // tool call instead of allowing parallel calls.
-                        if let Some(format) = tag
+                        // tool call instead of allowing parallel calls. A tag
+                        // without an object-valued `format` cannot carry the
+                        // constraint — fail loudly rather than silently
+                        // delivering an unconstrained tag.
+                        match tag
                             .get_mut("format")
                             .and_then(serde_json::Value::as_object_mut)
                         {
-                            format.insert(
-                                "stop_after_first".to_string(),
-                                serde_json::Value::Bool(true),
-                            );
+                            Some(format) => {
+                                format.insert(
+                                    "stop_after_first".to_string(),
+                                    serde_json::Value::Bool(true),
+                                );
+                            }
+                            None => {
+                                return Err(format!(
+                                    "parser '{name}' produced a structural tag without a format object; cannot honor parallel_tool_calls=false"
+                                ));
+                            }
                         }
                     }
                     let json_str = serde_json::to_string(&tag)
@@ -739,5 +749,32 @@ mod tests {
             )
             .unwrap();
         assert!(constraint.is_none());
+    }
+
+    #[test]
+    fn structural_tag_without_format_object_errors_when_parallel_disabled() {
+        // A builder whose tag has no object-valued "format" cannot carry
+        // stop_after_first; silently passing it through would break the
+        // single-call guarantee, so the registry must fail loudly.
+        let registry = ParserRegistry::new();
+        registry.register_parser_with_structural_tag(
+            "bad_tag",
+            || Box::new(PassthroughParser::new()),
+            |_tools, _at_least_one| json!({"unexpected": true}),
+        );
+
+        let err = registry
+            .generate_tool_constraint(Some("bad_tag"), &sample_tools(), &required(), false)
+            .expect_err("malformed tag must error when parallel calls are disabled");
+        assert!(
+            err.contains("bad_tag"),
+            "error should name the parser: {err}"
+        );
+
+        // With parallel calls enabled the tag passes through untouched.
+        let ok = registry
+            .generate_tool_constraint(Some("bad_tag"), &sample_tools(), &required(), true)
+            .unwrap();
+        assert!(ok.is_some());
     }
 }
