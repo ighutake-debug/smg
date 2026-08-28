@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -85,6 +86,35 @@ def _lazy_generate_req_input():
     from tokenspeed.runtime.engine.io_struct import GenerateReqInput
 
     return GenerateReqInput
+
+
+@functools.cache
+def _engine_supports_dp_rank_pin() -> bool:
+    """Capability probe: can this engine honor an attention-DP hard pin?
+
+    Gates both handshake sides — the ``dp_size`` label (GetServerInfo) and
+    the proto pin forwarding (Generate). Requires the engine request schema
+    AND the installed proto stubs to carry the field.
+    """
+    try:
+        engine_has_field = any(
+            f.name == "data_parallel_rank" for f in dataclasses.fields(_lazy_generate_req_input())
+        )
+    except Exception as exc:  # noqa: BLE001 — stubbed engine surface in tests.
+        logger.warning("dp-rank-pin capability probe failed; dp affinity disabled: %s", exc)
+        return False
+    # The installed smg-grpc-proto stubs must also carry the field: a stale
+    # wheel would make HasField() raise ValueError on EVERY Generate call.
+    stub_has_field = (
+        "data_parallel_rank" in tokenspeed_scheduler_pb2.GenerateRequest.DESCRIPTOR.fields_by_name
+    )
+    if engine_has_field and not stub_has_field:
+        logger.warning(
+            "engine supports data_parallel_rank but the installed "
+            "smg-grpc-proto stubs predate it; dp affinity disabled — "
+            "upgrade smg-grpc-proto."
+        )
+    return engine_has_field and stub_has_field
 
 
 def _finish_reason_to_dict(reason: Any) -> dict | None:
@@ -534,6 +564,22 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             server_args_dict = dataclasses.asdict(self.server_args)
         else:
             server_args_dict = dict(getattr(self.server_args, "__dict__", {}))
+        # Advertise the attention-DP width ("dp_size" is the exact key the
+        # gateway's label extraction reads) only when the engine can honor a
+        # rank pin — the label doubles as the capability handshake.
+        if _engine_supports_dp_rank_pin():
+            dp_size = getattr(
+                getattr(getattr(self.server_args, "mapping", None), "attn", None),
+                "dp_size",
+                None,
+            )
+            # > 1 only: a width-1 pin has no placement to choose, yet an
+            # explicit pin still changes engine-side scheduling. Dp-aware
+            # gateways degrade a missing label to a plain worker, so
+            # single-rank engines simply stay label-free.
+            if isinstance(dp_size, int) and dp_size > 1:
+                server_args_dict["dp_size"] = dp_size
+
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
 
@@ -581,6 +627,26 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         scheduler zmq channel; each reply carries ``num_reqs`` (running +
         waiting), ``num_waiting_reqs``, and ``num_pages`` (KV pages in use).
         """
+        # The EPD encode loop has no control-message dispatch: a GetLoadReqInput
+        # forwarded over the scheduler channel is submitted to the encode worker
+        # as if it were an encode request and kills the scheduler. Mirror the
+        # shallow health probe above — answer with an empty, well-formed
+        # response so a frontend polling loads on an encode worker reads "no
+        # scheduler load" instead of crashing the engine. Prefill/decode loops
+        # dispatch GetLoadReqInput correctly and keep reporting real loads.
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return tokenspeed_scheduler_pb2.GetLoadsResponse(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                version="tokenspeed",
+                dp_rank_count=0,
+                loads=[],
+                aggregate=tokenspeed_scheduler_pb2.AggregateMetrics(
+                    total_running_reqs=0,
+                    total_waiting_reqs=0,
+                    total_reqs=0,
+                    avg_token_usage=0.0,
+                ),
+            )
         try:
             load_outputs = await asyncio.wait_for(
                 self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
@@ -978,6 +1044,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             bootstrap_port = dp.bootstrap_port
             bootstrap_room = dp.bootstrap_room
 
+        # Attention-DP hard pin: only pass the kwarg at all when the engine
+        # schema carries it — an unknown kwarg raises TypeError on older
+        # engines, so "absent" cannot be spelled as "None".
+        pin_kwargs = {}
+        if _engine_supports_dp_rank_pin():
+            pin_kwargs["data_parallel_rank"] = (
+                request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+            )
+
         GenerateReqInput = _lazy_generate_req_input()
         obj = GenerateReqInput(
             input_ids=input_ids,
@@ -997,6 +1072,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            **pin_kwargs,
         )
         # ``normalize_batch_and_arguments`` asserts ``rid`` is a list when
         # n>1; expand to deterministic per-choice rids so the assert holds.

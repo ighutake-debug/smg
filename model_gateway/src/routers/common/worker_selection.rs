@@ -13,7 +13,10 @@ use openai_protocol::models::ListModelsResponse;
 
 use crate::{
     routers::{
-        common::header_utils::{apply_provider_headers, extract_auth_header},
+        common::{
+            header_utils::{apply_provider_headers, extract_auth_header},
+            overload,
+        },
         error,
     },
     worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
@@ -67,6 +70,17 @@ impl<'a> WorkerSelector<'a> {
         Self { registry, client }
     }
 
+    fn matches_worker_filters(worker: &Arc<dyn Worker>, req: &SelectWorkerRequest<'_>) -> bool {
+        req.worker_type
+            .is_none_or(|worker_type| *worker.worker_type() == worker_type)
+            && req
+                .connection_mode
+                .is_none_or(|mode| *worker.connection_mode() == mode)
+            && req
+                .runtime_type
+                .is_none_or(|runtime| worker.metadata().spec.runtime_type == runtime)
+    }
+
     /// Select the best worker for a model with refresh-on-miss.
     ///
     /// 1. Filter available workers by the request criteria.
@@ -81,6 +95,17 @@ impl<'a> WorkerSelector<'a> {
     ) -> Result<Arc<dyn Worker>, Response> {
         if let Some(worker) = self.find_best_worker(req) {
             return Ok(worker);
+        }
+
+        // Shed before the refresh, not after. Refresh-on-miss is the expensive
+        // branch — a second registry walk plus a `/v1/models` fan-out under a
+        // 5 s timeout — and a fleet whose every worker is vetoed will not be
+        // un-vetoed by re-reading model lists. Without this, saturation turns
+        // each of these requests into three registry walks and up to 5 s of
+        // network wait to reach a 503 that carries neither the shed error code
+        // nor the shed counter.
+        if let Some(shed) = self.shed_if_all_overloaded(req) {
+            return Err(shed);
         }
 
         tracing::debug!(
@@ -107,41 +132,57 @@ impl<'a> WorkerSelector<'a> {
         })
     }
 
-    fn get_candidates(&self, req: &SelectWorkerRequest<'_>) -> Vec<Arc<dyn Worker>> {
-        let workers = self.registry.get_workers_filtered(
-            None, // model_id index lookup not used — we filter via supports_model
-            req.worker_type,
-            req.connection_mode,
-            req.runtime_type,
-            false, // we filter availability ourselves for consistent behavior
-        );
-
-        let candidates: Vec<_> = workers.into_iter().filter(|w| w.is_available()).collect();
-
-        match &req.provider {
-            Some(provider) => filter_by_provider(candidates, provider),
-            None => candidates,
-        }
-    }
-
-    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
-        self.get_candidates(req)
+    /// The pool selection walks. `require_available` adds the `is_available()`
+    /// veto; the shed path takes the same pool without it, so the shed verdict
+    /// always describes exactly what selection saw.
+    fn candidate_pool(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+        require_available: bool,
+    ) -> Vec<Arc<dyn Worker>> {
+        let workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| Self::matches_worker_filters(worker, req))
+            .filter(|worker| !require_available || worker.is_available())
+            .cloned()
+            .collect();
+        let candidates = match &req.provider {
+            Some(provider) => filter_by_provider(workers, provider),
+            None => workers,
+        };
+        candidates
             .into_iter()
             .filter(|w| w.supports_model(req.model_id))
             .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
+            .collect()
+    }
+
+    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
+        self.candidate_pool(req, true)
+            .into_iter()
             .min_by_key(|w| w.load())
+    }
+
+    /// Shed when every worker this request could have selected is vetoed.
+    /// Runs only on the miss path.
+    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+        let candidates = self.candidate_pool(req, false);
+        overload::shed_if_all_overloaded(&candidates, req.model_id)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).
     /// Used to distinguish "model not found" from "all workers circuit-broken".
     fn any_worker_supports_model(&self, req: &SelectWorkerRequest<'_>) -> bool {
-        let workers = self.registry.get_workers_filtered(
-            None,
-            req.worker_type,
-            req.connection_mode,
-            req.runtime_type,
-            true, // healthy only — model exists even if circuit-broken
-        );
+        let workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| Self::matches_worker_filters(worker, req))
+            .filter(|worker| worker.is_healthy())
+            .cloned()
+            .collect();
         let candidates = match &req.provider {
             Some(p) => filter_by_provider(workers, p),
             None => workers,
@@ -162,9 +203,15 @@ impl<'a> WorkerSelector<'a> {
         auth_header: Option<&HeaderValue>,
         provider: Option<&ProviderType>,
     ) {
-        let mut external_workers =
-            self.registry
-                .get_workers_filtered(None, None, None, Some(RuntimeType::External), true);
+        let mut external_workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| {
+                worker.metadata().spec.runtime_type == RuntimeType::External && worker.is_healthy()
+            })
+            .cloned()
+            .collect();
 
         // Only refresh workers matching the request's provider to avoid sending
         // e.g. an OpenAI key to Anthropic workers during model discovery.
