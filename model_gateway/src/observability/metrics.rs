@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
+use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
@@ -127,6 +128,12 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Histogram buckets for `smg_cache_aware_match_ratio`. The ratio is
+/// dimensionless (matched/input, 0..1), so it takes deciles instead of the
+/// duration buckets; `le="0"` isolates requests with no cached prefix at all.
+pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
+    &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -144,6 +151,13 @@ pub fn register_jemalloc_as_global_allocator() {
 }
 
 pub(crate) fn init_metrics() {
+    describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
+    describe_counter!(
+        "smg_tokenizer_cache_evictions_total",
+        "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
+    );
+    describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+
     #[cfg(all(
         feature = "jemalloc-stats",
         not(target_env = "msvc"),
@@ -331,6 +345,15 @@ pub(crate) fn init_metrics() {
         "smg_cache_placement_entries",
         "Cache-aware hash-index placement entries by model (keys with a live holder)"
     );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
+         first_healthy_fallback)"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_ratio",
+        "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -467,6 +490,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_shm_write_failures_total",
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
+    describe_counter!(
+        "smg_mm_processing_total",
+        "Multimodal requests by processing location (router/worker) and resolution reason"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -481,6 +508,24 @@ pub(crate) fn init_metrics() {
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
     scheduler_metrics::describe();
+}
+
+/// Publish process-lifetime totals without scanning or retaining tokenizer instances.
+pub(super) fn record_tokenizer_cache_activity() {
+    for stats in cache_activity_stats() {
+        record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "hit")
+        .absolute(stats.hits);
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "miss")
+        .absolute(stats.misses);
+    counter!("smg_tokenizer_cache_evictions_total", "layer" => stats.layer)
+        .absolute(stats.evictions);
+    counter!("smg_tokenizer_cache_reused_bytes_total", "layer" => stats.layer)
+        .absolute(stats.reused_bytes);
 }
 
 #[expect(
@@ -513,6 +558,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
+    // matcher applies, so it also needs its own buckets or it renders as a
+    // summary.
+    let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -526,6 +576,8 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
         )
         .expect("failed to set event loop delay buckets")
+        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
+        .expect("failed to set cache-aware match ratio buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
@@ -835,6 +887,18 @@ impl Metrics {
     /// Record a SHM tensor write that failed and fell back to inline, for `runtime`.
     pub fn record_mm_shm_write_failure(runtime: &'static str) {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
+    }
+
+    /// Record where a multimodal request's media is processed and why.
+    pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_mm_processing_total",
+            "model" => model,
+            "mode" => mode,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -1281,6 +1345,21 @@ impl Metrics {
         gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
+    /// Record cache-aware policy execution branch for tree-mode routing decisions
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
+    /// tree-mode routing decision
+    pub fn record_cache_aware_match_ratio(ratio: f64) {
+        histogram!("smg_cache_aware_match_ratio").record(ratio);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(
@@ -1704,6 +1783,75 @@ mod tests {
         handle.render()
     }
 
+    #[test]
+    fn tokenizer_activity_registers_both_layers_on_scrape() {
+        let rendered = render_with_recorder(|| {
+            init_metrics();
+            record_tokenizer_cache_activity();
+        });
+        for layer in ["l0", "l1"] {
+            for name in [
+                "smg_tokenizer_cache_lookups_total",
+                "smg_tokenizer_cache_evictions_total",
+                "smg_tokenizer_cache_reused_bytes_total",
+            ] {
+                assert!(rendered
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}{{"))
+                        && line.contains(&format!("layer=\"{layer}\""))));
+            }
+        }
+    }
+
+    #[test]
+    fn tokenizer_activity_exports_monotonic_totals_without_double_counting() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            for layer in ["l0", "l1"] {
+                for (hits, misses, evictions, reused_bytes) in [(7, 3, 2, 1024), (9, 4, 3, 2048)] {
+                    let snapshot = CacheActivityStats {
+                        layer,
+                        hits,
+                        misses,
+                        evictions,
+                        reused_bytes,
+                    };
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    // An older concurrent scrape must not decrease counters either.
+                    record_tokenizer_cache_activity_snapshot(CacheActivityStats {
+                        hits: 0,
+                        misses: 0,
+                        evictions: 0,
+                        reused_bytes: 0,
+                        ..snapshot
+                    });
+                    let rendered = handle.render();
+                    for (name, result, value) in [
+                        ("smg_tokenizer_cache_lookups_total", Some("hit"), hits),
+                        ("smg_tokenizer_cache_lookups_total", Some("miss"), misses),
+                        ("smg_tokenizer_cache_evictions_total", None, evictions),
+                        ("smg_tokenizer_cache_reused_bytes_total", None, reused_bytes),
+                    ] {
+                        assert!(rendered.contains(&format!("# TYPE {name} counter")));
+                        assert!(
+                            rendered.lines().any(|line| {
+                                line.starts_with(&format!("{name}{{"))
+                                    && line.contains(&format!("layer=\"{layer}\""))
+                                    && result
+                                        .is_none_or(|r| line.contains(&format!("result=\"{r}\"")))
+                                    && line.ends_with(&format!(" {value}"))
+                            }),
+                            "missing {name} for {layer}: {rendered}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// Core engine gauges share these labels for the snapshot fixtures.
     const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];
 
@@ -1824,6 +1972,61 @@ mod tests {
                 "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
             );
         }
+    }
+
+    /// The match ratio must render as a real histogram (`_bucket{le=...}`
+    /// lines) once its buckets are registered the way `start_prometheus` does;
+    /// without them the recorder falls back to a summary.
+    #[test]
+    fn cache_aware_decision_metrics_render_counter_and_bucketed_histogram() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+                CACHE_AWARE_MATCH_RATIO_BUCKETS,
+            )
+            .expect("bucket override")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("spill");
+            Metrics::record_cache_aware_match_ratio(0.0);
+            Metrics::record_cache_aware_match_ratio(0.75);
+        });
+        let rendered = handle.render();
+
+        for (branch, value) in [("tree_match", "2"), ("spill", "1")] {
+            let series =
+                format!("smg_cache_aware_policy_branch_total{{branch=\"{branch}\"}} {value}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        for (le, count) in [
+            ("0", "1"),
+            ("0.7", "1"),
+            ("0.8", "2"),
+            ("1", "2"),
+            ("+Inf", "2"),
+        ] {
+            let series = format!("smg_cache_aware_match_ratio_bucket{{le=\"{le}\"}} {count}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "smg_cache_aware_match_ratio_count 2"),
+            "histogram count missing; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_cache_aware_match_ratio{quantile="),
+            "match ratio rendered as a summary; rendered:\n{rendered}"
+        );
     }
 
     #[test]

@@ -69,6 +69,15 @@ impl PreprocessedEncoderInputs {
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline.
 pub trait VisionPreProcessor: Send + Sync {
+    /// Whether preprocessing individual images and concatenating their outputs
+    /// is equivalent to preprocessing the whole batch, including metadata.
+    ///
+    /// Opt in only when resize, padding and normalization are independent of
+    /// other images. An output field layout alone does not guarantee this.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -197,6 +206,7 @@ impl VisionProcessorRegistry {
     /// Create a registry with all built-in processors registered.
     ///
     /// Currently registers:
+    /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
     /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
@@ -208,6 +218,16 @@ impl VisionProcessorRegistry {
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+
+        // DeepSeek-V4.1 vision variant (patch=14, 3x3 aligner downsample,
+        // gray-padded contain fit); registered under the HF model_type and
+        // the marketing id.
+        for pattern in ["deepseek_v41", "deepseek-v4.1"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::DeepseekV41Processor::new()),
+            );
+        }
 
         for pattern in [
             "glm-5.3-flash",
