@@ -36,6 +36,12 @@ Significant changes — new architecture, breaking API changes, new workspace
 crates, release planning, deprecations — are proposed as a GitHub issue or
 design discussion and decided by consensus among the core maintainers.
 
+Changes to a public contract — published crate APIs, `smg-client`, HTTP/OpenAPI,
+CLI and configuration, protobuf schemas, released artifacts — additionally
+follow the [API Stability Policy](governance/api-stability.md), which defines
+the supported boundary, change classification, deprecation windows, and the
+approval path for an intentional breaking change.
+
 If consensus cannot be reached in a reasonable time, the final decision
 rests with the core maintainers. Disagreements are expected to be resolved
 through discussion in the open, on GitHub.

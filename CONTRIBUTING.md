@@ -100,6 +100,12 @@ Signed-off-by: Your Name <your.email@example.com>
 - **Respond to review comments with a commit SHA and a one-line reason.**
   Example: `Fixed in abc1234 — capped total_chunks at 1024 before allocation`.
   Silence or "Fixed!" makes reviewers re-hunt your work.
+- **Classify contract changes.** If the PR touches a surface covered by the
+  [API Stability Policy](governance/api-stability.md), name the contract in the
+  description and classify the change as additive, deprecated-compatible, or
+  breaking. An intentional break follows the
+  [intentional breaking changes](governance/api-stability.md#intentional-breaking-changes)
+  requirements.
 
 ---
 
