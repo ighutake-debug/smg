@@ -18,9 +18,7 @@ from pathlib import Path
 
 import grpc
 import msgspec
-import numpy as np
 import sglang
-import torch
 import zmq
 import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
@@ -60,6 +58,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
 from ..pd_pairing import pairing_protocol_from_env
@@ -948,11 +947,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     @staticmethod
     def _decode_tensor_data(tensor_data):
         """Decode a proto TensorData message into a torch.Tensor."""
-        dtype_map = {"float32": np.float32, "int64": np.int64}
-        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
-        shape = list(tensor_data.shape)
-        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
-        return torch.from_numpy(arr)
+        return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
     def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
@@ -1227,6 +1222,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 reasoning_tokens=meta_info.get("reasoning_tokens", 0),
+                spec_accepted_tokens=meta_info.get("spec_num_correct_drafts", 0),
+                spec_draft_tokens=meta_info.get("spec_num_proposed_drafts", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
                 index=output.get("index", 0),
