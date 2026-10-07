@@ -8,8 +8,6 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 import asyncio
 import hashlib
 import itertools
-import json
-import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -38,7 +36,6 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
-from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
@@ -49,24 +46,34 @@ from smg_grpc_servicer.vllm.kv_events import (
     stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
-    pairing_fields,
     params_from_request,
     params_to_response_fields,
-    resolve_pd_connector,
 )
+
+# The launcher imports this module before it defines serve_grpc: the moment
+# the servicer switch has to be in place (see launcher_switch).
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
-    DEFAULT_MAX_INFLIGHT,
-    ENV_MAX_INFLIGHT,
     ENV_PROCESSOR,
+    PROCESSOR_FLAG,
     MmProcessorUnavailable,
+    MmSettings,
     build_mm_processor,
-    env_int,
 )
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
+from smg_grpc_servicer.vllm.mm_salt import (
+    engine_accepts_mm_inputs,
+    has_preprocessed_mm_payload,
+    mm_identity_cache_salt,
+)
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
+from smg_grpc_servicer.vllm.model_info import (
+    mm_device_do_normalize,
+    model_facts,
+    server_facts,
+)
 
-from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import (
     batches_missing_pixels,
     describes_media_twice,
@@ -77,27 +84,10 @@ from .mm_keys import (
     primary_encoder_key,
 )
 
+install_launcher_switch()
+
 logger = init_logger(__name__)
 attach_vllm_logging()
-SAMPLING_DEFAULT_KEYS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "repetition_penalty",
-)
-
-
-def _filtered_sampling_defaults(params: dict | None) -> dict:
-    if not params:
-        return {}
-    return {
-        key: params[key]
-        for key in SAMPLING_DEFAULT_KEYS
-        if key in params and params[key] is not None
-    }
-
-
 try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
@@ -153,21 +143,35 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - GetTokenizer: Stream tokenizer artifacts
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float):
+    def __init__(
+        self,
+        async_llm: EngineClient,
+        start_time: float,
+        mm_settings: MmSettings | None = None,
+    ):
         """
         Initialize the servicer.
 
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
+            mm_settings: The launcher's `--mm-*` flags; None (an older
+                launcher) resolves everything from the environment
         """
+        # The Rust path takes the process before this class exists; reaching
+        # here with the flag set means the launcher never consulted it.
+        from smg_grpc_servicer.vllm.rust import require_python_impl
+
+        require_python_impl()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
+        # Flag > env > default, resolved once so each value names its source.
+        self._mm_settings = (mm_settings or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
-        self._mm_processor = build_mm_processor(async_llm)
+        self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
         # loop, whether it fetches the media itself or converts tensors the
         # router already prepared. Both are sized by the same setting, so a
@@ -175,14 +179,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._mm_limit = (
             self._mm_processor.max_inflight
             if self._mm_processor is not None
-            else env_int(os.environ, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
+            else self._mm_settings.max_inflight
         )
         self._mm_inflight = asyncio.Semaphore(self._mm_limit)
         self._mm_waiting = 0
         self._unhealthy_logged = False
         logger.info(
-            "VllmEngineServicer initialized (mm_processor=%s)",
+            "VllmEngineServicer initialized (mm_processor=%s, source=%s)",
             self._mm_processor.name if self._mm_processor is not None else "off",
+            self._mm_settings.source,
         )
 
     async def _acquire_mm_slot(self) -> None:
@@ -277,6 +282,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         kv_transfer_params: dict | None = None
+        # What a PD prefill leg learned about its media, for the decode leg.
+        media_identity = None
         engine_started = False
         try:
             arrival_time = time.time()
@@ -292,8 +299,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 if self._mm_processor is None:
                     raise ValueError(
-                        f"media_refs sent but {ENV_PROCESSOR} is off on this worker; check the "
-                        "router's SMG_MM_PROCESSING and this worker's mm_processor label"
+                        f"media_refs sent but {PROCESSOR_FLAG} ({ENV_PROCESSOR}) is off on this "
+                        "worker; check the router's --mm-processing and this worker's "
+                        "mm_processor label"
                     )
                 items = parse_media_refs(request.media_refs)
                 validate_schemes(items, self._mm_processor.accepted_schemes)
@@ -308,6 +316,28 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 finally:
                     self._mm_inflight.release()
+                # A PD prefill leg answers with the identity so decode is
+                # served without pixels or references. The identity is an
+                # optimisation with a fallback (decode reprocesses), so a
+                # shape it cannot read must not fail a served request.
+                if kv_transfer_params is not None:
+                    if media_identity_supported():
+                        try:
+                            media_identity = build_media_identity(prompt)
+                        except Exception as e:  # noqa: BLE001 - any failure falls back
+                            logger.warning(
+                                "Request %s: media identity not built (%s); the decode leg "
+                                "will reprocess the media",
+                                request_id,
+                                e,
+                            )
+                            media_identity = None
+                    else:
+                        logger.warning(
+                            "Request %s: the installed smg-grpc-proto has no media_identity; "
+                            "the decode leg will reprocess the media",
+                            request_id,
+                        )
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
@@ -406,6 +436,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                                 completion=completion,
                                 num_logprobs=num_logprobs,
                                 num_prompt_logprobs=num_prompt_logprobs,
+                                media_identity=media_identity,
                             )
 
                 # For non-streaming, send complete response when finished
@@ -416,6 +447,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             completion=completion,
                             num_logprobs=num_logprobs,
                             num_prompt_logprobs=num_prompt_logprobs,
+                            media_identity=media_identity,
                         )
 
         except asyncio.CancelledError:
@@ -609,39 +641,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetModelInfoResponse protobuf
         """
-        model_config = self.engine.model_config
-        hf_config = model_config.hf_config
-
-        # eos_token_id can be int or list[int]
-        eos = getattr(hf_config, "eos_token_id", None)
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = eos
-        else:
-            eos_token_ids = []
-
-        sampling_defaults = _filtered_sampling_defaults(
-            model_config.get_diff_sampling_param() or {}
-        )
-
+        facts = model_facts(self.engine.model_config)
         return vllm_engine_pb2.GetModelInfoResponse(
-            model_path=model_config.model,
-            is_generation=model_config.runner_type == "generate",
-            max_context_length=model_config.max_model_len,
-            vocab_size=model_config.get_vocab_size(),
-            supports_vision=model_config.is_multimodal_model,
-            served_model_name=model_config.served_model_name or model_config.model,
-            tokenizer_path=model_config.tokenizer or "",
-            model_type=getattr(hf_config, "model_type", "") or "",
-            architectures=model_config.architectures or [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=getattr(hf_config, "pad_token_id", None) or 0,
-            bos_token_id=getattr(hf_config, "bos_token_id", None) or 0,
-            max_req_input_len=model_config.max_model_len,
-            default_sampling_params_json=(
-                json.dumps(sampling_defaults, separators=(",", ":")) if sampling_defaults else ""
-            ),
+            max_req_input_len=facts["max_context_length"], **facts
         )
 
     async def GetServerInfo(
@@ -659,39 +661,34 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetServerInfoResponse protobuf
         """
-        kv_connector = ""
-        kv_role = ""
-        kv_engine_id = ""
-        parallel = self.engine.vllm_config.parallel_config
-        kv_transfer_config = self.engine.vllm_config.kv_transfer_config
-        if kv_transfer_config is not None:
-            kv_connector, kv_engine_id = resolve_pd_connector(kv_transfer_config)
-            kv_role = kv_transfer_config.kv_role or ""
-            # Effective PD engine_id; with DP the engine cores serve
-            # `{id}_dp{rank}` and the router derives the suffix from the rank it
-            # pins per request.
-
+        facts = server_facts(self.engine.vllm_config)
         mm_processor = ""
         mm_media_ref_schemes = ""
+        # A --language-model-only engine accepts no multimodal inputs, so it
+        # must not advertise worker-side media processing either: the router
+        # would send media references this worker cannot expand.
         if (
             self._mm_processor is not None
-            and self.engine.model_config.is_multimodal_model
+            and engine_accepts_mm_inputs(self.engine.model_config)
             and await self._mm_processor.probe()
         ):
             mm_processor = self._mm_processor.name
             mm_media_ref_schemes = self._mm_processor.schemes
 
-        return vllm_engine_pb2.GetServerInfoResponse(
-            kv_connector=kv_connector,
-            kv_role=kv_role,
-            kv_engine_id=kv_engine_id,
-            data_parallel_size=parallel.data_parallel_size,
-            shm_namespace_id=mm_shm.shm_namespace_id(),
+        info = vllm_engine_pb2.GetServerInfoResponse(
             mm_processor=mm_processor,
             mm_media_ref_schemes=mm_media_ref_schemes,
-            pairing_protocol=pairing_protocol_from_env(),
-            **pairing_fields(self.engine.vllm_config),
+            **facts,
         )
+        # Where the processor mode came from, for the gateway's /workers; a
+        # proto package predating the field simply leaves it out.
+        if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
+            info.mm_processor_source = self._mm_settings.source
+        # Whether pixels are normalized on device, so the Router sends this
+        # engine raw pixels; likewise absent from an older proto package.
+        if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
+            info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        return info
 
     async def GetLoads(
         self,
@@ -1177,6 +1174,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         completion: "CompletionOutput | None" = None,
         num_logprobs: int | None = None,
         num_prompt_logprobs: int | None = None,
+        media_identity: "vllm_engine_pb2.MediaIdentity | None" = None,
     ) -> vllm_engine_pb2.GenerateResponse:
         """
         Build a final completion response from vLLM output.
@@ -1190,6 +1188,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
+            media_identity: A PD prefill leg's processed media, for the decode leg
 
         Returns:
             GenerateResponse with complete field set
@@ -1232,6 +1231,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
         stop_kwargs = {}
+        # A proto package predating the field cannot carry the identity.
+        if (
+            media_identity is not None
+            and "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+        ):
+            stop_kwargs["media_identity"] = media_identity
         if completion.stop_reason is not None:
             if isinstance(completion.stop_reason, int):
                 stop_kwargs["matched_token_id"] = completion.stop_reason

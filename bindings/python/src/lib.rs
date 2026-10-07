@@ -12,6 +12,11 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 use smg::*;
 use smg_auth as auth;
 
+mod servicer;
+use servicer::{
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,
+};
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
@@ -535,6 +540,15 @@ struct Router {
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
     multimodal_max_inflight_bytes: Option<usize>,
+    mm_processing: Option<String>,
+    mm_pixel_cache_mb: Option<usize>,
+    mm_pixel_rdma: bool,
+    rdma_listen_ip: Option<String>,
+    rdma_slot_ttl_s: Option<u64>,
+    log_mm_timing: bool,
+    prefill_max_inflight_requests_per_worker: i32,
+    prefill_queue_size: Option<usize>,
+    prefill_queue_timeout_secs: Option<u64>,
 }
 
 impl Router {
@@ -613,6 +627,19 @@ impl Router {
                         field: "multimodal_tensor_transport".to_string(),
                         value: value.to_string(),
                         reason: "expected 'inline', 'shm', 'auto', or 'rdma'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let mm_processing = self
+            .mm_processing
+            .as_deref()
+            .map(|value| {
+                config::MmProcessingMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_processing".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'auto', 'router', or 'worker'".to_string(),
                     }
                 })
             })
@@ -827,6 +854,7 @@ impl Router {
                 match self.backend {
                     BackendType::Vllm => Some(worker::RuntimeType::Vllm),
                     BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
                     _ => None,
                 }
             } else {
@@ -859,6 +887,9 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -931,6 +962,12 @@ impl Router {
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
+            .mm_processing(mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1120,6 +1157,15 @@ impl Router {
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
         multimodal_max_inflight_bytes = None,
+        mm_processing = None,
+        mm_pixel_cache_mb = None,
+        mm_pixel_rdma = false,
+        rdma_listen_ip = None,
+        rdma_slot_ttl_s = None,
+        log_mm_timing = false,
+        prefill_max_inflight_requests_per_worker = -1,
+        prefill_queue_size = None,
+        prefill_queue_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1280,6 +1326,15 @@ impl Router {
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
         multimodal_max_inflight_bytes: Option<usize>,
+        mm_processing: Option<String>,
+        mm_pixel_cache_mb: Option<usize>,
+        mm_pixel_rdma: bool,
+        rdma_listen_ip: Option<String>,
+        rdma_slot_ttl_s: Option<u64>,
+        log_mm_timing: bool,
+        prefill_max_inflight_requests_per_worker: i32,
+        prefill_queue_size: Option<usize>,
+        prefill_queue_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1452,6 +1507,15 @@ impl Router {
             rl_control_timeout_secs,
             rl_fanout_concurrency,
             multimodal_max_inflight_bytes,
+            mm_processing,
+            mm_pixel_cache_mb,
+            mm_pixel_rdma,
+            rdma_listen_ip,
+            rdma_slot_ttl_s,
+            log_mm_timing,
+            prefill_max_inflight_requests_per_worker,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
         })
     }
 
@@ -1671,10 +1735,14 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
+    m.add_class::<PyVllmGrpcServer>()?;
+    m.add_class::<PyTokenSpeedGrpcServer>()?;
+    m.add_class::<PySglangGrpcServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
 }

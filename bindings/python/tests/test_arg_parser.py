@@ -571,6 +571,46 @@ class TestParseRouterArgs:
         defaults = parse_router_args([])
         assert defaults.mm_per_request_image_limit is None
 
+    def test_parse_mm_settings_flags(self):
+        """Media placement and engine-side media knobs; unset leaves each to its env fallback."""
+        router_args = parse_router_args(
+            [
+                "--mm-processing",
+                "worker",
+                "--mm-pixel-cache-mb",
+                "256",
+                "--mm-pixel-rdma",
+                "--rdma-listen-ip",
+                "10.0.0.7",
+                "--rdma-slot-ttl-s",
+                "600",
+                "--log-mm-timing",
+            ]
+        )
+        assert router_args.mm_processing == "worker"
+        assert router_args.mm_pixel_cache_mb == 256
+        assert router_args.mm_pixel_rdma is True
+        assert router_args.rdma_listen_ip == "10.0.0.7"
+        assert router_args.rdma_slot_ttl_s == 600
+        assert router_args.log_mm_timing is True
+
+        defaults = parse_router_args([])
+        assert defaults.mm_processing is None
+        assert defaults.mm_pixel_cache_mb is None
+        assert defaults.mm_pixel_rdma is False
+        assert defaults.rdma_listen_ip is None
+        assert defaults.rdma_slot_ttl_s is None
+        assert defaults.log_mm_timing is False
+
+        with pytest.raises(SystemExit):
+            parse_router_args(["--mm-processing", "routers"])
+        # Same spelling rules as the Rust CLI: case-insensitive, sign-checked.
+        assert parse_router_args(["--mm-processing", "Router"]).mm_processing == "router"
+        for flag in ("--mm-pixel-cache-mb", "--rdma-slot-ttl-s"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, "-1"])
+        assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(
@@ -797,6 +837,29 @@ class TestParseRouterArgs:
         assert router_args.pd_disaggregation is True
         assert router_args.prefill_policy == "consistent_hashing"
         assert router_args.decode_policy == "prefix_hash"
+
+    def test_parse_pd_prefill_admission_args(self):
+        """Test parsing explicit Prefill admission options."""
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "none",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-max-inflight-requests-per-worker",
+            "7",
+            "--prefill-queue-size",
+            "13",
+            "--prefill-queue-timeout-secs",
+            "17",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.prefill_max_inflight_requests_per_worker == 7
+        assert router_args.prefill_queue_size == 13
+        assert router_args.prefill_queue_timeout_secs == 17
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
@@ -1469,6 +1532,15 @@ class TestRouterArgsFieldOrder:
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
         "multimodal_max_inflight_bytes",
+        "mm_processing",
+        "mm_pixel_cache_mb",
+        "mm_pixel_rdma",
+        "rdma_listen_ip",
+        "rdma_slot_ttl_s",
+        "log_mm_timing",
+        "prefill_max_inflight_requests_per_worker",
+        "prefill_queue_size",
+        "prefill_queue_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

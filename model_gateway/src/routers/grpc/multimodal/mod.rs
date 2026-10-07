@@ -15,10 +15,7 @@
 //! - [`refs`]: router-vs-worker processing resolution and the media-reference
 //!   payload for workers that process media themselves.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, sync::Arc};
 
 use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
@@ -58,13 +55,17 @@ mod plan;
 mod process;
 mod refs;
 mod serialize;
+mod settings;
 mod transport;
+pub mod worker;
 
 pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
-pub(crate) use capability::ensure_backend_supports_modalities;
+pub(crate) use capability::{
+    ensure_backend_supports_modalities, worker_language_model_only, SUPPORTS_VISION_LABEL,
+};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
@@ -80,18 +81,14 @@ pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
     worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
+pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
-/// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
-/// Read from the environment once and cached; the flag is not expected to change
-/// at runtime, and this is called on every multimodal request.
-fn log_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
+/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
+/// request.
+pub(crate) fn log_mm_timing_enabled() -> bool {
+    mm_settings().log_mm_timing.value
 }
 
 /// Output of the multimodal processing pipeline.
@@ -206,4 +203,25 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     /// not take `pixel_values` (DeepSeek-V4.1 takes `patches`); `None` keeps
     /// the default name.
     pub encoder_input_key: Option<String>,
+}
+
+/// Say once which JPEG decoder this process has, and publish it: without
+/// libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a few
+/// levels, an embedding shift against an engine that decodes with PIL.
+pub(crate) fn report_jpeg_decoder() {
+    use crate::observability::metrics::Metrics;
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+        Metrics::set_mm_turbojpeg_available(available);
+        if available {
+            tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
+        } else {
+            tracing::warn!(
+                "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
+                 differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
+                 an engine that decodes with PIL"
+            );
+        }
+    });
 }
