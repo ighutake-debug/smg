@@ -27,7 +27,7 @@ use super::{
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
-    multimodal::MultimodalComponents,
+    multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
     utils::ParserResolver,
@@ -103,6 +103,7 @@ impl GrpcRouter {
                 ctx.multimodal_config_registry.clone(),
                 ctx.router_config.mm_per_request_image_limit,
                 ctx.router_config.multimodal_max_inflight_bytes,
+                mm_settings(),
             )
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));
@@ -125,6 +126,7 @@ impl GrpcRouter {
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -137,6 +139,7 @@ impl GrpcRouter {
         let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
         );
 
@@ -308,6 +311,7 @@ impl GrpcRouter {
                 Some(tenant_meta.clone()),
                 Some(rate_limit_cell.clone()),
                 Some(&retry_config),
+                None,
             )
             .await;
 

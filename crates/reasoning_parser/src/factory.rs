@@ -145,6 +145,7 @@ impl ParserFactory {
 
         // MiniMax M3: <mm:think> / </mm:think>, always_in_reasoning=false
         registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser("hy_v4", || Box::new(HyV4Parser::new()));
 
         // uses <|START_THINKING|> / <|END_THINKING|>
         registry.register_parser("cohere_cmd", || Box::new(CohereCmdParser::new()));
@@ -207,6 +208,8 @@ impl ParserFactory {
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
+        registry.register_pattern("hy4", "hy_v4");
+        registry.register_pattern("hy_v4", "hy_v4");
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         // V4.1 before V4: first substring hit wins and "deepseek-v4" is a
         // substring of every V4.1 model id.

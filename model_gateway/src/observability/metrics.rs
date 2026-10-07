@@ -267,7 +267,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
-        "KV connector mode decisions by mode (mooncake/nixl/passthrough)"
+        "KV connector mode decisions by mode (mooncake/nixl/moriio/passthrough)"
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
@@ -276,6 +276,22 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
         "PD KV-transfer failures (missing connector params at decode handoff)"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight",
+        "Prefill requests admitted by SMG per worker"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_queued",
+        "Requests waiting in the SMG Prefill admission queue"
+    );
+    describe_histogram!(
+        "smg_pd_prefill_admission_wait_seconds",
+        "Time spent waiting in the SMG Prefill admission queue"
+    );
+    describe_counter!(
+        "smg_pd_prefill_admission_rejections_total",
+        "Prefill admission rejections by reason"
     );
 
     // Layer 3: Worker metrics
@@ -493,6 +509,14 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_mm_processing_total",
         "Multimodal requests by processing location (router/worker) and resolution reason"
+    );
+    describe_gauge!(
+        "smg_mm_turbojpeg_available",
+        "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
+    );
+    describe_counter!(
+        "smg_responses_stream_failures_total",
+        "Responses streams that ended with a response.failed terminal, by model and reason"
     );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
@@ -889,7 +913,24 @@ impl Metrics {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
     }
 
+    pub fn set_mm_turbojpeg_available(available: bool) {
+        gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
+    }
+
     /// Record where a multimodal request's media is processed and why.
+    /// Count a Responses stream whose terminal event was `response.failed`.
+    ///
+    /// `reason` is a bounded label (`stream_error`, `server_error`, `other`).
+    pub fn record_responses_stream_failure(model_id: &str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_responses_stream_failures_total",
+            "model" => model,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -1174,7 +1215,7 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record a KV connector mode decision (mooncake/nixl/passthrough).
+    /// Record a KV connector mode decision (mooncake/nixl/moriio/passthrough).
     pub fn record_pd_kv_connector_mode(mode: &'static str) {
         counter!(
             "smg_pd_kv_connector_mode_total",
@@ -1201,6 +1242,35 @@ impl Metrics {
     /// Record a PD dispatch shed because no decode slot freed in time.
     pub fn record_pd_admission_shed() {
         counter!("smg_pd_admission_sheds_total").increment(1);
+    }
+
+    /// Set the number of requests SMG has admitted to a prefill worker.
+    pub fn set_pd_prefill_admission_inflight(worker_url: &str, count: usize) {
+        let worker = intern_string(worker_url);
+        gauge!(
+            "smg_pd_prefill_admission_inflight",
+            "worker" => worker
+        )
+        .set(count as f64);
+    }
+
+    /// Set the depth of the Router-wide Prefill admission queue.
+    pub fn set_pd_prefill_admission_queued(depth: usize) {
+        gauge!("smg_pd_prefill_admission_queued").set(depth as f64);
+    }
+
+    /// Record how long a request waited in the Prefill admission queue.
+    pub fn record_pd_prefill_admission_wait(duration: Duration) {
+        histogram!("smg_pd_prefill_admission_wait_seconds").record(duration.as_secs_f64());
+    }
+
+    /// Record a Prefill admission rejection (queue full or timeout).
+    pub fn record_pd_prefill_admission_rejection(reason: &'static str) {
+        counter!(
+            "smg_pd_prefill_admission_rejections_total",
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -1704,6 +1774,7 @@ impl Metrics {
         gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!("smg_pd_prefill_admission_inflight", "worker" => Arc::clone(&worker)).set(0.0);
 
         // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
         // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
@@ -1850,6 +1921,20 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn prefill_worker_removal_resets_admission_gauge() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
+            Metrics::remove_worker_metrics("http://removed-prefill");
+        });
+        assert_metric(
+            &rendered,
+            "smg_pd_prefill_admission_inflight",
+            &[r#"worker="http://removed-prefill""#],
+            "0",
+        );
     }
 
     /// Core engine gauges share these labels for the snapshot fixtures.

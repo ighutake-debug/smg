@@ -8,7 +8,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use openai_protocol::worker::TransportMode;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
@@ -164,6 +164,12 @@ enum Commands {
 fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
     TransportMode::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
+}
+
+/// Parse the `--mm-processing` value into an `MmProcessingMode`.
+fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
+    MmProcessingMode::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected auto, router, or worker"))
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -428,11 +434,10 @@ struct CliArgs {
     dp_aware: bool,
 
     /// Sticky sessions: route every request of a conversation to the same
-    /// worker, on any policy. The key is derived from the request body's rid
-    /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to the routing-key headers when no rid is present.
-    /// Enabling this keeps automatic body forwarding buffered so body rid
-    /// precedence is preserved.
+    /// worker, on any policy. Valid routing-key headers take priority over
+    /// a key derived from the request body's rid, with per-turn/per-retry
+    /// suffixes stripped (conv_t2_r1 -> conv). Enabling this keeps automatic
+    /// body forwarding buffered so the body rid remains available as fallback.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,
@@ -508,6 +513,18 @@ struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
+
+    /// Maximum in-flight Prefill requests per worker in PD or EPD mode (non-positive to disable)
+    #[arg(long, default_value_t = -1, help_heading = "PD Disaggregation")]
+    prefill_max_inflight_requests_per_worker: i32,
+
+    /// Maximum number of requests waiting for Prefill admission (default: 100 when enabled)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    prefill_queue_size: Option<usize>,
+
+    /// Maximum time in seconds a request may wait for Prefill admission (default: 60 when enabled)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    prefill_queue_timeout_secs: Option<u64>,
 
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
@@ -612,6 +629,41 @@ struct CliArgs {
     /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
     mm_per_request_image_limit: Option<u64>,
+
+    /// Where media for vLLM gRPC workers is fetched and preprocessed:
+    /// `auto` (worker when the model spec and the worker both allow it,
+    /// else router), `router` (always the gateway), `worker` (always the
+    /// engine; models without worker expansion are rejected). Falls back to
+    /// `SMG_MM_PROCESSING`, then `auto`.
+    #[arg(long, value_parser = parse_mm_processing, help_heading = "Multimodal")]
+    mm_processing: Option<MmProcessingMode>,
+
+    /// Pixel cache budget in MiB for router-side preprocessed media; 0 keeps
+    /// the cache off. Falls back to `SMG_MM_PIXEL_CACHE_MB`.
+    #[arg(long, help_heading = "Multimodal")]
+    mm_pixel_cache_mb: Option<usize>,
+
+    /// Serve cached pixels over RDMA instead of inline bytes (the legacy
+    /// switch; `--multimodal-tensor-transport rdma` is the first-class one).
+    /// Falls back to `SMG_MM_PIXEL_RDMA`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    mm_pixel_rdma: bool,
+
+    /// Listener IP for the RDMA pixel lane's metadata exchange; without one
+    /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
+    #[arg(long, help_heading = "Multimodal")]
+    rdma_listen_ip: Option<String>,
+
+    /// Seconds a leased RDMA pixel slot lives without a free notification;
+    /// must exceed the worker's hold or it is ignored for the derived TTL.
+    /// Falls back to `SMG_RDMA_SLOT_TTL_S`.
+    #[arg(long, help_heading = "Multimodal")]
+    rdma_slot_ttl_s: Option<u64>,
+
+    /// Emit per-request multimodal timing at INFO. Falls back to
+    /// `SMG_LOG_MM_TIMING`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    log_mm_timing: bool,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -1804,6 +1856,7 @@ impl CliArgs {
             match self.backend {
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
                 _ => None,
             }
         } else {
@@ -1890,9 +1943,18 @@ impl CliArgs {
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
+            .mm_processing(self.mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .priority_scheduler_enabled(self.priority_scheduler_enabled)
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
@@ -2860,6 +2922,66 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
+    /// The media placement and engine-side media flags must reach both
+    /// `RouterConfig` and the wrapped `ServerConfig.router_config`.
+    #[test]
+    fn mm_settings_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--mm-processing",
+            "worker",
+            "--mm-pixel-cache-mb",
+            "256",
+            "--mm-pixel-rdma",
+            "--rdma-listen-ip",
+            "10.0.0.7",
+            "--rdma-slot-ttl-s",
+            "600",
+            "--log-mm-timing",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(router_config.mm_pixel_cache_mb, Some(256));
+        assert!(router_config.mm_pixel_rdma);
+        assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
+        assert!(router_config.log_mm_timing);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        let nested = &server_config.router_config;
+        assert_eq!(nested.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(nested.mm_pixel_cache_mb, Some(256));
+        assert!(nested.mm_pixel_rdma);
+        assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(nested.rdma_slot_ttl_s, Some(600));
+        assert!(nested.log_mm_timing);
+    }
+
+    #[test]
+    fn mm_settings_default_to_unset_in_both_configs() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.mm_processing, None);
+        assert_eq!(router_config.mm_pixel_cache_mb, None);
+        assert!(!router_config.mm_pixel_rdma);
+        assert_eq!(router_config.rdma_listen_ip, None);
+        assert_eq!(router_config.rdma_slot_ttl_s, None);
+        assert!(!router_config.log_mm_timing);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.mm_processing, None);
+        assert!(!server_config.router_config.log_mm_timing);
+    }
+
+    #[test]
+    fn mm_processing_rejects_unknown_modes_at_parse_time() {
+        assert!(Cli::try_parse_from(["smg", "--mm-processing", "routers"]).is_err());
+        assert!(Cli::try_parse_from(["smg", "--rdma-slot-ttl-s", "soon"]).is_err());
+        assert!(Cli::try_parse_from(["smg", "--mm-pixel-cache-mb", "-1"]).is_err());
+        let cli = cli_args_from(&["--mm-processing", "Router"]);
+        assert_eq!(cli.mm_processing, Some(MmProcessingMode::Router));
+    }
+
     /// The multimodal transport flags must reach both `RouterConfig` and the
     /// wrapped `ServerConfig.router_config`. Two-path config-plumbing guard.
     #[test]
@@ -2989,6 +3111,21 @@ mod tests {
             server_config.router_config.startup_worker_runtime_type,
             Some(RuntimeType::TokenSpeed),
             "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+
+        let sglang = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        assert_eq!(
+            sglang
+                .to_router_config(vec![], vec![])
+                .unwrap()
+                .startup_worker_runtime_type,
+            Some(RuntimeType::Sglang),
+            "--backend sglang must pin the ZMQ startup worker runtime"
         );
     }
 
