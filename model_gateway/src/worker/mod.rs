@@ -3,8 +3,10 @@
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
+pub mod endpoint;
 pub mod error;
 pub mod event;
+pub mod expected_wait;
 pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
@@ -15,6 +17,7 @@ pub mod monitor;
 pub mod overload;
 pub mod pd_pair_index;
 pub mod pd_pairing;
+pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
 pub mod sampling_defaults;
@@ -32,6 +35,9 @@ pub mod worker;
 pub use builder::BasicWorkerBuilder;
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+// `endpoint::Endpoint` is deliberately not re-exported here: `model_type::Endpoint`
+// already occupies that name at this level and means an API route, not an address.
+pub use endpoint::{endpoint_key, EndpointError, EndpointKey};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
@@ -48,6 +54,11 @@ pub use openai_protocol::{
 pub use overload::OverloadThresholds;
 pub(crate) use pd_pair_index::{PdPairIndex, PdWire};
 pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
+pub use prefill_admission::{
+    acquire_prefill, AdmittedPrefill, PrefillAcquireError, PrefillAdmission,
+    PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
+    PrefillReservation, PrefillSelection, PrefillSelectionContext,
+};
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
@@ -56,5 +67,6 @@ pub use service::WorkerService;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
+    NIXL_CONNECTOR,
 };

@@ -31,6 +31,15 @@ def _parse_int_csv(value: str) -> list[int]:
     return [int(item) for item in value.split(",") if item]
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse type for the unsigned Rust settings; rejects a minus sign here
+    rather than in the binding's conversion after parsing."""
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return number
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -260,6 +269,23 @@ class RouterArgs:
     # Appended last so callers that build RouterArgs positionally keep
     # their existing field order.
     multimodal_max_inflight_bytes: int | None = None
+    # Where media for vLLM gRPC workers is fetched and preprocessed:
+    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
+    mm_processing: str | None = None
+    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
+    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
+    mm_pixel_cache_mb: int | None = None
+    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
+    mm_pixel_rdma: bool = False
+    # Listener IP for the RDMA metadata exchange; None falls back to SMG_RDMA_LISTEN_IP
+    rdma_listen_ip: str | None = None
+    # Full-TTL override (seconds) for leased RDMA slots; None falls back to SMG_RDMA_SLOT_TTL_S
+    rdma_slot_ttl_s: int | None = None
+    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
+    log_mm_timing: bool = False
+    prefill_max_inflight_requests_per_worker: int = -1
+    prefill_queue_size: int | None = None
+    prefill_queue_timeout_secs: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -775,8 +801,8 @@ class RouterArgs:
             action="store_true",
             help=(
                 "Sticky sessions: route every request of a conversation to the"
-                " same worker, on any policy (keys derived from the request-id"
-                " lineage, falling back to the routing-key headers)"
+                " same worker, on any policy (valid routing-key headers take"
+                " priority, falling back to the request-id lineage)"
             ),
         )
         routing_group.add_argument(
@@ -850,6 +876,33 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-max-inflight-requests-per-worker",
+            type=int,
+            default=RouterArgs.prefill_max_inflight_requests_per_worker,
+            help=(
+                "Maximum in-flight Prefill requests per worker in PD or EPD mode."
+                " A non-positive value disables the limit (default: -1)."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-size",
+            type=int,
+            default=RouterArgs.prefill_queue_size,
+            help=(
+                "Maximum number of requests waiting for Prefill admission."
+                " Defaults to 100 when Prefill admission is enabled; 0 disables waiting."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-timeout-secs",
+            type=int,
+            default=RouterArgs.prefill_queue_timeout_secs,
+            help=(
+                "Maximum time in seconds a request may wait for Prefill admission."
+                " Defaults to 60 when Prefill admission is enabled."
+            ),
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -943,6 +996,63 @@ class RouterArgs:
                 " model spec's built-in limit (e.g. to match the engine's"
                 " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
             ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-processing",
+            type=str.lower,
+            choices=["auto", "router", "worker"],
+            default=RouterArgs.mm_processing,
+            help=(
+                "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
+                " (worker when the model spec and the worker both allow it, else"
+                " router), router (always the gateway), worker (always the engine;"
+                " models without worker expansion are rejected). Falls back to"
+                " SMG_MM_PROCESSING, then auto"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-cache-mb",
+            type=_non_negative_int,
+            default=RouterArgs.mm_pixel_cache_mb,
+            help=(
+                "Pixel cache budget in MiB for router-side preprocessed media; 0 keeps"
+                " the cache off. Falls back to SMG_MM_PIXEL_CACHE_MB"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-rdma",
+            action="store_true",
+            default=RouterArgs.mm_pixel_rdma,
+            help=(
+                "Serve cached pixels over RDMA instead of inline bytes (the legacy"
+                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                " Falls back to SMG_MM_PIXEL_RDMA"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-listen-ip",
+            type=str,
+            default=RouterArgs.rdma_listen_ip,
+            help=(
+                "Listener IP for the RDMA pixel lane's metadata exchange; without one"
+                " the lane stays on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-slot-ttl-s",
+            type=_non_negative_int,
+            default=RouterArgs.rdma_slot_ttl_s,
+            help=(
+                "Seconds a leased RDMA pixel slot lives without a free notification;"
+                " must exceed the worker's hold or it is ignored. Falls back to"
+                " SMG_RDMA_SLOT_TTL_S"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}log-mm-timing",
+            action="store_true",
+            default=RouterArgs.log_mm_timing,
+            help="Emit per-request multimodal timing at INFO. Falls back to SMG_LOG_MM_TIMING",
         )
 
         # Logging configuration
@@ -1382,8 +1492,9 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
             help=(
-                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
-                "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
+                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
             ),
         )
         backend_group.add_argument(

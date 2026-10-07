@@ -33,7 +33,7 @@ use super::{
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
-        ProtoRequest, ProtoStream,
+        ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
     spec::ResponseSpec,
     utils::ParserResolver,
@@ -42,7 +42,9 @@ use crate::{
     middleware::TenantRequestMeta,
     policies::CacheNamespace,
     routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{
+        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+    },
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -211,7 +213,7 @@ pub(crate) struct ProcessingState {
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
-    /// Effective sticky key (rid-derived wins, header falls back), recorded by
+    /// Effective sticky key (header wins, rid-derived falls back), recorded by
     /// worker selection so load guards account keyed load identically.
     pub sticky_key: Option<String>,
 
@@ -221,6 +223,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
+
+    /// Prefill admission slot, taken during PD/EPD worker selection and
+    /// handed to the dispatch that runs the Prefill leg.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -288,6 +294,9 @@ pub(crate) struct DispatchContext {
     pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
+    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
+    /// reselection refills it.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
 }
 
@@ -554,6 +563,20 @@ impl PreparationOutput {
         }
     }
 
+    /// Longest single input in tokens -- what the engine's context window
+    /// bounds. Every prompt of a batched `Completion` is dispatched as its own
+    /// engine request, so the window applies per item, not to their sum.
+    pub fn max_input_token_count(&self) -> usize {
+        match self {
+            Self::Completion { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
+            other => other.token_ids().len(),
+        }
+    }
+
     /// Text for worker routing: original_text for regular pipelines, selection_text for Harmony.
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
@@ -630,10 +653,9 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
-    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    /// Disaggregated guards cover the decode leg only. The Prefill load is
+    /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
     Disaggregated {
-        _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -657,10 +679,7 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
@@ -851,6 +870,7 @@ impl RequestContext {
             multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
+            pd_prefill_guard: state.pd_prefill_guard,
             response: state.response,
         })
     }
@@ -1228,8 +1248,18 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
+        /// when that sample completes; siblings retain their guards. A leg
+        /// whose prefill already ran to completion in the execution stage
+        /// (sequential PD) carries `None` — there is no live guard to release.
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
+        /// Input (prompt) logprobs harvested from the prefill `Complete` frame.
+        /// `Some` only for sequential PD, where the execution stage drains the
+        /// prefill stream before the streaming layer runs; parallel/fan-out PD
+        /// leaves this `None` and the streaming layer drains the stream itself.
+        prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
     /// Embedding requests return a single response, not a stream
     Embedding {
@@ -1290,6 +1320,131 @@ mod tests {
         }
     }
 
+    fn pd_selection(prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>) -> WorkerSelection {
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(prefill),
+            decode: Arc::clone(decode),
+            runtime_type: RuntimeType::Sglang,
+        }
+    }
+
+    #[test]
+    fn disaggregated_load_guards_hold_decode_only() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-load")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-load")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        assert_eq!(prefill.load(), 1);
+        drop(prefill_guard);
+
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 1);
+        drop(guards);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_prompts_preserve_phase_load_semantics() {
+        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let routing_key = "batch-key";
+
+        let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+        let admitted = match admission
+            .admit(Some(routing_key), {
+                let prefill = Arc::clone(&prefill);
+                move |capacity| capacity.select(Arc::clone(&prefill), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("initial admission should succeed"),
+        };
+        let prefill_guard = PrefillLoadGuard::Admission {
+            _reservation: Arc::new(admitted.reservation),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), Some(routing_key)),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 3);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 2);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+    }
+
     #[test]
     fn completion_preparation_routes_by_first_item_or_joined_text() {
         let scalar = completion_prep(&["hello"], None);
@@ -1328,6 +1483,43 @@ mod tests {
 
         let scalar = completion_prep(&["hello"], None);
         assert_eq!(scalar.total_input_token_count(), scalar.token_ids().len());
+    }
+
+    /// The context window bounds each engine request, and a batched
+    /// Completion dispatches one per prompt: the length check must see the
+    /// longest item, not the batch total (which would reject a batch of
+    /// short prompts) nor the first item (which would miss a long later one).
+    #[test]
+    fn max_input_token_count_is_the_longest_batched_completion_item() {
+        let batch = PreparationOutput::Completion {
+            items: vec![
+                CompletionItem {
+                    text: "short".to_string(),
+                    token_ids: vec![1],
+                },
+                CompletionItem {
+                    text: "much longer prompt".to_string(),
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+            joined_routing_text: Some("short much longer prompt".to_string()),
+        };
+
+        assert_eq!(batch.max_input_token_count(), 5);
+        assert_ne!(batch.max_input_token_count(), batch.token_ids().len());
+        assert_ne!(
+            batch.max_input_token_count(),
+            batch.total_input_token_count()
+        );
+
+        let scalar = completion_prep(&["hello"], None);
+        assert_eq!(scalar.max_input_token_count(), scalar.token_ids().len());
+
+        let empty = PreparationOutput::Completion {
+            items: vec![],
+            joined_routing_text: None,
+        };
+        assert_eq!(empty.max_input_token_count(), 0);
     }
 
     #[test]

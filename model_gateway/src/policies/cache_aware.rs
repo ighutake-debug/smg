@@ -226,6 +226,28 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
     (counts.values().sum(), counts.len())
 }
 
+/// The per-model tree, created on first sight.
+///
+/// Reads first: `DashMap::entry` takes the shard's *exclusive* lock (and a
+/// `String` key allocation) on every call, and every request for a model lands
+/// on the same shard, so the selection hot path would serialize on it. A shared
+/// read plus an `Arc` clone is uncontended; only a model's first request pays
+/// for the insert.
+fn tree_for_model<V>(
+    trees: &DashMap<String, Arc<V>>,
+    model_id: &str,
+    new_tree: impl FnOnce() -> V,
+) -> Arc<V> {
+    if let Some(tree) = trees.get(model_id) {
+        return Arc::clone(tree.value());
+    }
+    trees
+        .entry(model_id.to_string())
+        .or_insert_with(|| Arc::new(new_tree()))
+        .value()
+        .clone()
+}
+
 impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
@@ -1144,13 +1166,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // side alone would break every same-namespace match. It stays
             // unpartitioned here; the approximate and hash modes below key
             // under the request's cache namespace.
-            if self.has_event_indexer(model_id) {
+            if let Some(index) = self.event_index_for(model_id) {
                 self.select_worker_event_driven(
                     workers,
                     tokens,
                     &healthy_indices,
                     avg_load,
-                    model_id,
+                    &index,
                     info,
                 )
             } else {
@@ -1223,18 +1245,43 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 }
 
+/// The event-driven index resolved once per request for the selection.
+struct EventIndex<'a> {
+    indexer: Arc<PositionalIndexer>,
+    block_size: usize,
+    model_id: &'a str,
+}
+
 // Private helper methods for select_worker
 impl CacheAwarePolicy {
-    /// Check if an event-driven indexer exists with data for this model.
-    /// Returns false when the indexer is empty (startup, reconnect) so
-    /// routing falls through to the approximate token tree instead of
-    /// taking the event-driven path with no data and landing on a fallback.
-    fn has_event_indexer(&self, model_id: &str) -> bool {
+    /// The event-driven index for this model: its indexer and block size.
+    /// `None` when there is no monitor or indexer, or the indexer is empty
+    /// (startup, reconnect), so routing falls through to the approximate
+    /// token tree instead of taking the event-driven path with no data and
+    /// landing on a fallback. One monitor lock and one indexer lookup serve
+    /// both this check and the selection that follows.
+    fn event_index_for<'a>(&self, model_id: &'a str) -> Option<EventIndex<'a>> {
         let guard = self.kv_monitor.read();
-        guard
-            .as_ref()
-            .and_then(|m| m.get_indexer(model_id))
-            .is_some_and(|indexer| indexer.current_size() > 0)
+        let monitor = guard.as_ref()?;
+        let indexer = monitor.get_indexer(model_id)?;
+        if indexer.current_size() == 0 {
+            return None;
+        }
+        // Per-model block_size: learned from events > config default
+        let block_size = monitor
+            .block_size(model_id)
+            .unwrap_or(self.config.block_size);
+        Some(EventIndex {
+            indexer,
+            block_size,
+            model_id,
+        })
+    }
+
+    /// Check if an event-driven indexer exists with data for this model.
+    #[cfg(test)]
+    fn has_event_indexer(&self, model_id: &str) -> bool {
+        self.event_index_for(model_id).is_some()
     }
 
     /// The shared load snapshot for waiting-prefill decay, or `None` when
@@ -1431,17 +1478,15 @@ impl CacheAwarePolicy {
         tokens: &[u32],
         healthy_indices: &[usize],
         avg_load: f64,
-        model_id: &str,
+        index: &EventIndex<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let guard = self.kv_monitor.read();
-        let monitor = guard.as_ref()?;
-        let indexer = monitor.get_indexer(model_id)?;
-
-        // Per-model block_size: learned from events > config default
-        let block_size = monitor
-            .block_size(model_id)
-            .unwrap_or(self.config.block_size);
+        let EventIndex {
+            indexer,
+            block_size,
+            model_id,
+        } = index;
+        let block_size = *block_size;
 
         let waiting_prefill_tokens = self.waiting_prefill_snapshot();
         let tuning = OverlapTuning {
@@ -1454,7 +1499,7 @@ impl CacheAwarePolicy {
             workers,
             tokens,
             healthy_indices,
-            &indexer,
+            indexer,
             block_size,
             &tuning,
         );
@@ -1942,12 +1987,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = self
-            .token_trees
-            .entry(model_id.to_string())
-            .or_insert_with(|| Arc::new(self.new_token_tree()))
-            .value()
-            .clone();
+        let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
 
         // A partitioned request keys under its namespace marker: another
         // namespace diverges at position 0 and can never match, and the
@@ -2031,12 +2071,7 @@ impl CacheAwarePolicy {
         model_id: &str,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let tree = self
-            .string_trees
-            .entry(model_id.to_string())
-            .or_insert_with(|| Arc::new(Tree::new()))
-            .value()
-            .clone();
+        let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
 
         // Same partition rule as the token tree, in chars.
         let prefixed;
@@ -2062,7 +2097,7 @@ impl CacheAwarePolicy {
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    text.chars().count(),
+                    input,
                     avg_load,
                     info,
                 )

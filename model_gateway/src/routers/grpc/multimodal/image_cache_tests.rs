@@ -4,7 +4,9 @@ use llm_multimodal::{ImageSource, Tokenizer, TransformError, VisionPreProcessor}
 use ndarray::Array2;
 
 use super::*;
-use crate::routers::grpc::multimodal::config::MultimodalConfigRegistry;
+use crate::routers::grpc::multimodal::{
+    config::MultimodalConfigRegistry, settings::MultimodalSettings,
+};
 
 #[derive(Default)]
 struct Calls {
@@ -101,8 +103,13 @@ fn setup(
             reorder,
         }),
     );
-    let mut components =
-        MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None).unwrap();
+    let mut components = MultimodalComponents::new(
+        Arc::new(MultimodalConfigRegistry::new()),
+        None,
+        None,
+        &MultimodalSettings::default(),
+    )
+    .unwrap();
     components.vision_processor_registry = Arc::new(registry);
     components.pixel_cache = Some(Arc::new(PixelCache::new(1024 * 1024)));
     (
@@ -125,13 +132,13 @@ async fn run(
     let media = MediaBatch::Images(
         ids.iter()
             .map(|&id| {
-                Arc::new(ImageFrame {
-                    image: image::DynamicImage::new_rgb8(id, 1),
-                    raw_bytes: Default::default(),
-                    detail: Default::default(),
-                    source: ImageSource::InlineBytes,
-                    hash: id.to_string(),
-                })
+                Arc::new(ImageFrame::new(
+                    image::DynamicImage::new_rgb8(id, 1),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
             })
             .collect(),
     );
@@ -164,7 +171,7 @@ async fn mixed_hits_and_out_of_order_misses_preserve_order() {
     assert_eq!(result.feature_token_counts, [1, 3, 2, 3]);
     assert_eq!(result.item_sizes, [(1, 1), (3, 1), (2, 1), (3, 1)]);
     assert_eq!(
-        result.encoder_input.as_slice().unwrap(),
+        result.encoder_input.flat_f32().into_owned(),
         [1.0, 3.0, 2.0, 3.0]
     );
     calls.batches.lock().unwrap().clear();
@@ -180,7 +187,7 @@ async fn repeated_cold_images_keep_every_occurrence() {
         let result = run(&components, &config, &[1, 2, 1, 2, 1], "tok").await;
         assert_eq!(*calls.batches.lock().unwrap(), vec![vec![2], vec![1]]);
         assert_eq!(
-            result.encoder_input.as_slice().unwrap(),
+            result.encoder_input.flat_f32().into_owned(),
             [1.0, 2.0, 1.0, 2.0, 1.0]
         );
         assert_eq!(result.feature_token_counts, [1, 2, 1, 2, 1]);
@@ -199,7 +206,7 @@ async fn cache_separates_preprocessing_model_and_tokenizer_parameters() {
     config.preprocessor_config.rescale_factor = Some(2.0);
     calls.batches.lock().unwrap().clear();
     let result = run(&components, &config, &[3, 4], "tok").await;
-    assert_eq!(result.encoder_input.as_slice().unwrap(), [6.0, 8.0]);
+    assert_eq!(result.encoder_input.flat_f32().into_owned(), [6.0, 8.0]);
     assert_eq!(calls.batches.lock().unwrap().len(), 2);
     config.config["revision"] = serde_json::json!(2);
     calls.batches.lock().unwrap().clear();

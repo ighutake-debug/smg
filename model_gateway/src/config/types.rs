@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
-pub use openai_protocol::worker::TransportMode;
+pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{Deserialize, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
@@ -40,7 +40,7 @@ pub struct RouterConfig {
     /// boundary. Ascending; empty disables boundary-based keying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_boundaries: Vec<usize>,
-    /// Per-request sticky-session routing (rid-lineage keys, header fallback).
+    /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
     /// How strictly PD placement pairs a prefill with a decode on their KV
@@ -172,6 +172,31 @@ pub struct RouterConfig {
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
+    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
+    /// then `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_processing: Option<MmProcessingMode>,
+    /// Host-DRAM budget (MiB) for router-side preprocessed media; when unset,
+    /// falls back to `SMG_MM_PIXEL_CACHE_MB`, then 0 (no cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_pixel_cache_mb: Option<usize>,
+    /// Serve cached pixels over RDMA (the legacy switch; `multimodal_tensor_transport
+    /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
+    #[serde(default)]
+    pub mm_pixel_rdma: bool,
+    /// Listener IP for the RDMA metadata exchange; when unset, falls back to
+    /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_listen_ip: Option<String>,
+    /// Full-TTL override (seconds) for leased RDMA pixel slots; when unset, falls
+    /// back to `SMG_RDMA_SLOT_TTL_S`, then the TTL derived from the worker's hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma_slot_ttl_s: Option<u64>,
+    /// Emit per-request multimodal timing at INFO; when unset, falls back to
+    /// `SMG_LOG_MM_TIMING`.
+    #[serde(default)]
+    pub log_mm_timing: bool,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -195,6 +220,18 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
+    /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
+    /// A non-positive value disables the limit.
+    #[serde(default = "default_disabled_limit")]
+    pub prefill_max_inflight_requests_per_worker: i32,
+    /// Maximum number of PD requests waiting for Prefill admission.
+    /// `None` applies the built-in default when admission is enabled.
+    #[serde(default)]
+    pub prefill_queue_size: Option<usize>,
+    /// Maximum time a PD request may wait for Prefill admission.
+    /// `None` applies the built-in default when admission is enabled.
+    #[serde(default)]
+    pub prefill_queue_timeout_secs: Option<u64>,
     /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
     /// concurrency alone.
     pub rate_limit_tokens_per_second: Option<i32>,
@@ -368,6 +405,13 @@ fn default_load_monitor_interval_secs() -> u64 {
 fn default_pd_admission_wait_secs() -> u64 {
     DEFAULT_PD_ADMISSION_WAIT_SECS
 }
+
+const fn default_disabled_limit() -> i32 {
+    -1
+}
+
+pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
+pub const DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS: u64 = 60;
 
 fn default_job_queue_capacity() -> usize {
     1000
@@ -604,12 +648,11 @@ impl PdPairingMode {
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
 ///
-/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
-/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
-/// conversation shares one key) wins over the routing-key headers; the first
-/// configured header carrying a valid value is the fallback when no rid is
-/// present. An enabled override keeps automatic body forwarding buffered so
-/// body `rid` precedence is preserved.
+/// Key priority is fixed: the first configured routing-key header carrying a
+/// valid value wins. A key derived from the typed body's `rid` is the fallback
+/// (per-turn `_t<n>` and per-retry `_r<n>` suffixes stripped). An enabled
+/// override keeps automatic body forwarding buffered so the body `rid`
+/// remains available when no valid header key is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -1164,6 +1207,12 @@ impl Default for RouterConfig {
             multimodal_shm_min_bytes: None,
             multimodal_max_inflight_bytes: None,
             mm_per_request_image_limit: None,
+            mm_processing: None,
+            mm_pixel_cache_mb: None,
+            mm_pixel_rdma: false,
+            rdma_listen_ip: None,
+            rdma_slot_ttl_s: None,
+            log_mm_timing: false,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
@@ -1179,6 +1228,9 @@ impl Default for RouterConfig {
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
+            prefill_max_inflight_requests_per_worker: default_disabled_limit(),
+            prefill_queue_size: None,
+            prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
@@ -1265,6 +1317,16 @@ impl RouterConfig {
             Some(trace_config) => trace_config.enable_trace,
             None => false,
         }
+    }
+
+    pub fn effective_prefill_queue_size(&self) -> usize {
+        self.prefill_queue_size
+            .unwrap_or(DEFAULT_PREFILL_QUEUE_SIZE)
+    }
+
+    pub fn effective_prefill_queue_timeout_secs(&self) -> u64 {
+        self.prefill_queue_timeout_secs
+            .unwrap_or(DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS)
     }
 
     /// Compute the effective retry config considering disable flag
@@ -1397,6 +1459,54 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    #[test]
+    fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
+        // Unset by default, and the optional ones stay out of serialized output.
+        let config = RouterConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        for key in [
+            "mm_processing",
+            "mm_pixel_cache_mb",
+            "rdma_listen_ip",
+            "rdma_slot_ttl_s",
+        ] {
+            assert!(!json.contains(key), "unset {key} must be omitted");
+        }
+
+        // Config files predating the fields deserialize to the defaults.
+        let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = without.as_object_mut().unwrap();
+        object.remove("mm_pixel_rdma").unwrap();
+        object.remove("log_mm_timing").unwrap();
+        let without: RouterConfig = serde_json::from_value(without).unwrap();
+        assert_eq!(without.mm_processing, None);
+        assert_eq!(without.mm_pixel_cache_mb, None);
+        assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.rdma_listen_ip, None);
+        assert_eq!(without.rdma_slot_ttl_s, None);
+        assert!(!without.log_mm_timing);
+
+        // When set, every value round-trips, the mode as its lowercase name.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .mm_processing(Some(MmProcessingMode::Worker))
+            .mm_pixel_cache_mb(Some(512))
+            .mm_pixel_rdma(true)
+            .rdma_listen_ip(Some("10.0.0.7"))
+            .rdma_slot_ttl_s(Some(600))
+            .log_mm_timing(true)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""mm_processing":"worker""#));
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
+        assert_eq!(with.mm_pixel_cache_mb, Some(512));
+        assert!(with.mm_pixel_rdma);
+        assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(with.rdma_slot_ttl_s, Some(600));
+        assert!(with.log_mm_timing);
     }
 
     #[test]

@@ -133,6 +133,12 @@ pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
+/// vLLM MoRI-IO KV connector name
+pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
+
+/// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
+pub const MORIIO_MODE_LABEL: &str = "moriio_mode";
+
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
 async fn admin_http_post(
@@ -292,6 +298,16 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
+/// Context window advertised for `model_id` in `models`: the matching card's
+/// (aliases included), else the primary card's. Borrows only, so it is safe on
+/// the per-request path.
+fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
+    models
+        .find(model_id)
+        .or_else(|| models.primary())
+        .and_then(|card| card.context_length)
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug + 'static {
@@ -376,6 +392,22 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Increment the load counter
     fn increment_load(&self);
+
+    /// Increment the load counter only when the resulting value does not exceed `max`.
+    ///
+    /// Implementations backed by an atomic counter should override this method
+    /// with a compare-and-update operation. This fallback preserves the limit
+    /// for existing external implementations, but can reject usable capacity
+    /// during concurrent attempts.
+    fn try_increment_load(&self, max: usize) -> bool {
+        self.increment_load();
+        if self.load() <= max {
+            true
+        } else {
+            self.decrement_load();
+            false
+        }
+    }
 
     /// Decrement the load counter
     fn decrement_load(&self);
@@ -658,6 +690,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().mutates_request()
     }
 
+    /// Whether [`Worker::prepare_request`] is the built-in edit, the
+    /// `data_parallel_rank` insert for a DP-aware worker, and nothing else.
+    /// The HTTP proxy path then applies that edit on raw JSON slices instead
+    /// of round-tripping the body through `serde_json::Value`. An
+    /// implementation with its own `prepare_request` keeps the default,
+    /// `false`, so its edits and errors still run.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        false
+    }
+
     /// Get the model ID this worker serves.
     fn model_id(&self) -> &str {
         self.metadata().model_id()
@@ -703,6 +745,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get all models this worker can serve.
     fn models(&self) -> Vec<ModelCard> {
         self.metadata().spec.models.all().to_vec()
+    }
+
+    /// Context window (in tokens) this worker advertises for `model_id`, from
+    /// the matching model card (falling back to the primary card). `None`
+    /// when the worker never advertised one; callers then leave the length
+    /// check to the engine.
+    ///
+    /// `BasicWorker` overrides this to consult its lazy-discovered
+    /// `models_override`, as `supports_model` does.
+    fn context_length(&self, model_id: &str) -> Option<u32> {
+        context_length_from(&self.metadata().spec.models, model_id)
     }
 
     /// Set models for this worker (for lazy discovery).
@@ -1205,6 +1258,14 @@ impl WorkerRuntime {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn try_increment_load(&self, max: usize) -> bool {
+        self.load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next <= max)
+            })
+            .is_ok()
+    }
+
     /// Saturating decrement. Returns `true` if the counter was decremented,
     /// `false` if it was already zero — callers can log when that happens.
     pub fn try_decrement_load(&self) -> bool {
@@ -1363,6 +1424,12 @@ impl BasicWorker {
         self.kv_engine_id_unconfirmed = Arc::clone(&previous.kv_engine_id_unconfirmed);
     }
 
+    /// The circuit breaker configuration this worker runs with: the gateway
+    /// defaults plus its own overrides, as resolved at registration.
+    pub(crate) fn circuit_breaker_config(&self) -> super::circuit_breaker::CircuitBreakerConfig {
+        self.circuit_breaker.load().config().clone()
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
@@ -1446,6 +1513,9 @@ impl BasicWorker {
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
         if other_cb.config() == existing_cb.config() {
+            // Building this worker reset the URL's breaker state gauge to
+            // closed; the adopted breaker is what monitoring must show.
+            other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
 
@@ -1478,6 +1548,12 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
+    /// HTTP proxy path may apply the DP-rank edit on raw slices.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        true
+    }
+
     fn kv_engine_id(&self) -> Option<String> {
         self.kv_engine_id.load_full().map(|id| (*id).clone())
     }
@@ -1597,6 +1673,14 @@ impl Worker for BasicWorker {
     fn increment_load(&self) {
         self.runtime.load().increment_load();
         self.update_running_requests_metrics();
+    }
+
+    fn try_increment_load(&self, max: usize) -> bool {
+        let incremented = self.runtime.load().try_increment_load(max);
+        if incremented {
+            self.update_running_requests_metrics();
+        }
+        incremented
     }
 
     fn decrement_load(&self) {
@@ -1725,6 +1809,15 @@ impl Worker for BasicWorker {
             overridden.all()
         };
         source.to_vec()
+    }
+
+    fn context_length(&self, model_id: &str) -> Option<u32> {
+        let overridden = self.models_override.load();
+        if overridden.is_wildcard() {
+            context_length_from(&self.metadata.spec.models, model_id)
+        } else {
+            context_length_from(&overridden, model_id)
+        }
     }
 
     fn set_models(&self, models: Vec<ModelCard>) {
@@ -1945,7 +2038,46 @@ impl WorkerLoadGuard {
     /// wins over the header), so keyed-load accounting matches selection.
     pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         worker.increment_load();
+        Self::from_acquired_load(worker, routing_key)
+    }
 
+    pub fn try_new(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        max: usize,
+    ) -> Option<Self> {
+        let key = extract_routing_key(headers);
+        Self::try_new_with_key(worker, key, max)
+    }
+
+    pub fn try_new_with_key(
+        worker: Arc<dyn Worker>,
+        routing_key: Option<&str>,
+        max: usize,
+    ) -> Option<Self> {
+        if !worker.try_increment_load(max) {
+            return None;
+        }
+        Some(Self::from_acquired_load(worker, routing_key))
+    }
+
+    /// Acquire another load guard for the same worker and routing key.
+    ///
+    /// This is explicit instead of implementing `Clone` because replication
+    /// increments externally visible worker load.
+    pub(crate) fn replicate(&self) -> Self {
+        self.worker.increment_load();
+        if let Some(ref key) = self.routing_key {
+            self.worker.increment_routing_key_load(key);
+        }
+
+        Self {
+            worker: Arc::clone(&self.worker),
+            routing_key: self.routing_key.clone(),
+        }
+    }
+
+    fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         let routing_key = routing_key.map(String::from);
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
@@ -2050,6 +2182,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 mod tests {
     use std::{thread, time::Duration};
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -2057,6 +2190,48 @@ mod tests {
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder,
     };
+
+    /// The `smg_worker_cb_state` sample for the test worker's URL in a
+    /// rendered scrape.
+    fn cb_state_gauge(rendered: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("smg_worker_cb_state{worker=\"http://worker:8000\"} ")
+            })
+            .map(|value| value.parse().unwrap())
+    }
+
+    /// A same-URL replacement is built on a fresh breaker, which sets the
+    /// URL's state gauge to closed before the registry adopts the live
+    /// breaker. Adoption must publish the adopted state again, or an open
+    /// breaker reads as closed until its next transition.
+    #[test]
+    fn adopting_a_live_breaker_republishes_its_state_gauge() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let config = CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            };
+            let old = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config.clone())
+                .build();
+            old.record_circuit_breaker_outcome(false);
+            assert_eq!(old.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+
+            let new = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config)
+                .build();
+            assert_eq!(cb_state_gauge(&handle.render()), Some(0.0));
+
+            assert!(new.inherit_shared_state_from(&old));
+            assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+        });
+    }
 
     /// Health config that skips health checks — workers start Ready immediately.
     /// Use in tests that don't test the health check lifecycle.
@@ -3169,6 +3344,23 @@ mod tests {
         drop(guard2);
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.routing_key_load(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_respects_atomic_limit() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let first = WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).unwrap();
+        assert!(WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).is_none());
+
+        drop(first);
+        let second = WorkerLoadGuard::try_new(Arc::clone(&worker), None, 1).unwrap();
+        drop(second);
+        assert_eq!(worker.load(), 0);
     }
 
     #[test]

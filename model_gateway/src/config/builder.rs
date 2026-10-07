@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use openai_protocol::worker::TransportMode;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
@@ -327,6 +327,42 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
+        self.config.mm_processing = mode;
+        self
+    }
+
+    /// Host-DRAM budget (MiB) for router-side preprocessed media.
+    pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
+        self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
+    pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
+        self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// Listener IP for the RDMA metadata exchange.
+    pub fn rdma_listen_ip(mut self, ip: Option<impl Into<String>>) -> Self {
+        self.config.rdma_listen_ip = ip.map(Into::into);
+        self
+    }
+
+    /// Full-TTL override (seconds) for leased RDMA pixel slots.
+    pub fn rdma_slot_ttl_s(mut self, secs: Option<u64>) -> Self {
+        self.config.rdma_slot_ttl_s = secs;
+        self
+    }
+
+    /// Emit per-request multimodal timing at INFO.
+    pub fn log_mm_timing(mut self, enabled: bool) -> Self {
+        self.config.log_mm_timing = enabled;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
@@ -346,6 +382,21 @@ impl RouterConfigBuilder {
 
     pub fn queue_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.queue_timeout_secs = timeout;
+        self
+    }
+
+    pub fn prefill_max_inflight_requests_per_worker(mut self, max: i32) -> Self {
+        self.config.prefill_max_inflight_requests_per_worker = max;
+        self
+    }
+
+    pub fn prefill_queue_size(mut self, size: Option<usize>) -> Self {
+        self.config.prefill_queue_size = size;
+        self
+    }
+
+    pub fn prefill_queue_timeout_secs(mut self, timeout: Option<u64>) -> Self {
+        self.config.prefill_queue_timeout_secs = timeout;
         self
     }
 
